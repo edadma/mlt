@@ -3,8 +3,9 @@
 Scala Native bindings for [MLT](https://www.mltframework.org/) — the multitrack audio/video
 authoring framework that powers Shotcut, Kdenlive, and Flowblade.
 
-> **Status:** early. The framework lifecycle, version, and property bag are bound and working;
-> the service hierarchy (producers, filters, consumers, playlists) is next.
+> **Status:** early, but decoding real video. The framework lifecycle, profiles, the property bag,
+> producers (including `avformat` media files), and frame rendering all work. Consumers, playlists,
+> filters, and transitions are next.
 
 ## Requirements
 
@@ -24,12 +25,25 @@ default paths resolve `libmlt-7` and its headers as-is.
 import io.github.edadma.mlt.*
 
 @main def run(): Unit =
-  println(s"MLT ${Mlt.version}")
-
   Mlt.init()
-  println(s"modules: ${Mlt.directory}")
+
+  val profile  = Profile("atsc_720p_30")
+  val producer = Producer(profile, "demo.mp4")
+
+  producer.seek(producer.length / 2)
+
+  val frame = producer.frame()
+  val img   = frame.image(ImageFormat.Rgba)
+
+  println(s"${img.width}x${img.height}, ${img.pixels.length} bytes")
+
+  frame.close()
+  producer.close()
+  profile.close()
   Mlt.close()
 ```
+
+`sbt run` renders a frame of the bundled `demo.mp4` and writes it out as a PPM.
 
 ## Design
 
@@ -77,6 +91,19 @@ close your wrapper, and the playlist's reference keeps it alive.
 
 `close()` is idempotent, and every accessor is guarded, so double-close and use-after-close raise a
 Scala exception with a stack trace instead of segfaulting inside libmlt.
+
+### Pixel formats, and the one unavoidable copy
+
+MLT's `mlt_image_format` offers only `rgb` and `rgba` — byte order R,G,B,A. There is **no BGRA**.
+Cairo's `ARGB32` is native-endian, so on a little-endian machine it wants B,G,R,A in memory.
+
+That matters because an image codec can usually be *asked* for a given layout and made to write
+straight into a target surface. MLT cannot, so painting a frame through Cairo costs a channel swap.
+`rgbaToArgb32` does it in place, a 32-bit word at a time — at 1080p30 that path moves ~250 MB/s.
+
+Note also that MLT renders letterbox/pillarbox padding as **transparent** black (alpha 0) while the
+picture itself is alpha 255 — so a surface receiving a frame should be cleared to a known colour
+rather than assuming full coverage.
 
 ## License
 
