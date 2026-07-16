@@ -145,6 +145,49 @@ object LibMlt:
   def mlt_producer_set_speed(self: mlt_producer, speed: CDouble): CInt                    = extern
   def mlt_producer_get_speed(self: mlt_producer): CDouble                                 = extern
 
+  // -- Consumer --------------------------------------------------------------------------------
+
+  /** Construct a consumer from a named module — "sdl2" to render to a window, "avformat" to encode
+    * to a file, "null" to pull frames and discard them. `resource` is module-specific (an output
+    * filename for "avformat") and may be null. Returns null if no module can handle it. */
+  def mlt_factory_consumer(profile: mlt_profile, service: CString, resource: CString): mlt_consumer = extern
+
+  /** Construct a bare consumer with no module behind it. It has no output of its own, which is
+    * exactly what an application wanting the frames for itself needs: connect a producer, then pull
+    * with [[mlt_consumer_rt_frame]]. */
+  def mlt_consumer_new(profile: mlt_profile): mlt_consumer = extern
+
+  /** Attach `producer` (or any service) as the consumer's input. Returns 0 on success. */
+  def mlt_consumer_connect(self: mlt_consumer, producer: mlt_service): CInt = extern
+
+  /** Begin consuming. With the `real_time` property non-zero this spawns MLT's own render threads,
+    * which decode ahead into a buffer. Returns non-zero on error. */
+  def mlt_consumer_start(self: mlt_consumer): CInt = extern
+
+  /** Stop consuming, joining any render threads. Returns non-zero on error. */
+  def mlt_consumer_stop(self: mlt_consumer): CInt = extern
+
+  def mlt_consumer_is_stopped(self: mlt_consumer): CInt = extern
+
+  /** Discard buffered frames — what a seek during playback needs, so that stale frames decoded ahead
+    * of the jump are not shown after it. */
+  def mlt_consumer_purge(self: mlt_consumer): Unit = extern
+
+  /** Pull the next frame synchronously, rendering it on the calling thread. */
+  def mlt_consumer_get_frame(self: mlt_consumer): mlt_frame = extern
+
+  /** Pull the next frame with the consumer's real-time policy applied: when `real_time` is non-zero
+    * this takes an already-decoded frame from the read-ahead buffer (and may drop frames to keep
+    * pace); when it is zero this is [[mlt_consumer_get_frame]]. Returns null at end of stream.
+    *
+    * The returned frame belongs to the caller and must be closed. */
+  def mlt_consumer_rt_frame(self: mlt_consumer): mlt_frame = extern
+
+  def mlt_consumer_position(self: mlt_consumer): mlt_position = extern
+
+  /** Release a consumer, stopping it first if it is still running. */
+  def mlt_consumer_close(self: mlt_consumer): Unit = extern
+
   // -- Frame -----------------------------------------------------------------------------------
 
   /** Render this frame's image. `format` is in/out: pass the desired [[mlt_image_format]] and MLT
@@ -161,6 +204,16 @@ object LibMlt:
   ): CInt = extern
 
   def mlt_frame_get_position(self: mlt_frame): mlt_position = extern
+
+  // -- Image formats ---------------------------------------------------------------------------
+
+  /** The name of an `mlt_image_format` — "rgba", "yuv422", and so on. This is the spelling MLT's
+    * own string properties use, so it is what a format must be converted to before being set as
+    * one. Returns a static string; do not free it. */
+  def mlt_image_format_name(format: CInt): CString = extern
+
+  /** The `mlt_image_format` a name denotes — the inverse of [[mlt_image_format_name]]. */
+  def mlt_image_format_id(name: CString): CInt = extern
 
   /** Release a frame obtained from [[mlt_service_get_frame]]. */
   def mlt_frame_close(self: mlt_frame): Unit = extern

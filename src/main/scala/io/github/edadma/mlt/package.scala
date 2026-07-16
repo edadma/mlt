@@ -157,11 +157,154 @@ object Producer:
     new Producer(p)
   }
 
+/** The far end of a graph: what pulls frames out of it. Consumers come in two shapes, and which one
+  * you have decides the whole shape of your loop.
+  *
+  * A **module consumer** ([[Consumer.apply]]) drives itself — "avformat" encodes to a file, "sdl2"
+  * renders to a window. Connect a producer, [[start]], and it runs on its own render threads until
+  * the input ends; the application waits on [[isStopped]] rather than pulling. Do not also pull from
+  * one: its threads are consuming the same frames, and the two of you will race for them.
+  *
+  * A **bare consumer** ([[Consumer.bare]]) has no output of its own. It is the one for an application
+  * that wants the frames itself — a preview pane — and the loop is [[rtFrame]] until the stream ends.
+  *
+  * Frames must be pulled from a thread the application owns, and used on it. MLT's render threads are
+  * C threads the Scala Native runtime knows nothing about, so no Scala code may run on one — which is
+  * why this binding exposes no `mlt_events` listeners such as `consumer-frame-show`. Pull; do not be
+  * called back. */
+class Consumer private[mlt] (ptr: lib.mlt_consumer) extends Service(ptr):
+
+  /** Attach the service this consumer pulls from. */
+  def connect(service: Service): Unit =
+    guard(if lib.mlt_consumer_connect(ptr, service.ptr) != 0 then fail("mlt_consumer_connect"))
+
+  /** Begin consuming, spawning a module consumer's render threads. Set the properties that configure
+    * those threads — [[realTime]], [[buffer]], [[imageFormat]] — before calling this; they are read
+    * once, here.
+    *
+    * On a bare consumer this does nothing at all, by MLT's design rather than by omission: the first
+    * thing `mlt_consumer_start` does is return if the consumer is not stopped, and a consumer with no
+    * module behind it has no way to report itself stopped, so it always looks like it is already
+    * running. Call it anyway — it costs nothing and keeps a graph's setup uniform. */
+  def start(): Unit = guard(if lib.mlt_consumer_start(ptr) != 0 then fail("mlt_consumer_start"))
+
+  /** Stop consuming, joining any render threads. */
+  def stop(): Unit = guard(if lib.mlt_consumer_stop(ptr) != 0 then fail("mlt_consumer_stop"))
+
+  /** Whether the consumer has finished or been stopped. This is how to wait out a module consumer,
+    * paired with [[terminateOnPause]].
+    *
+    * Always false on a bare consumer, which has no module to answer the question — detect the end of
+    * a pull loop with [[Frame.speed]] instead. */
+  def isStopped: Boolean = guard(lib.mlt_consumer_is_stopped(ptr) != 0)
+
+  /** Throw away frames already decoded into the read-ahead buffer. Needed after a seek during
+    * playback, or the frames decoded before the jump are shown after it. */
+  def purge(): Unit = guard(lib.mlt_consumer_purge(ptr))
+
+  /** The position of the frame most recently pulled. */
+  def position: Int = guard(lib.mlt_consumer_position(ptr))
+
+  /** Pull the next frame. On a bare consumer this renders on the calling thread; the frame's image
+    * is not decoded until asked for, so the cost lands in [[Frame.imagePtr]], not here.
+    *
+    * `None` means MLT could produce nothing at all — not the end of the stream. Running off the end
+    * of a producer yields real frames forever, repeating the last one, so a pull loop must stop on
+    * [[Frame.speed]] reaching zero instead.
+    *
+    * The frame belongs to the caller and must be closed — dropping one on the floor here leaks a
+    * whole decoded image. */
+  def rtFrame(): Option[Frame] = guard {
+    val f = lib.mlt_consumer_rt_frame(ptr)
+
+    if f == null then scala.None else Some(new Frame(f))
+  }
+
+  /** Pull the next frame, bypassing the read-ahead buffer even on a module consumer that has one.
+    * On a bare consumer this is what [[rtFrame]] already does. */
+  def getFrame(): Frame = guard {
+    val f = lib.mlt_consumer_get_frame(ptr)
+
+    if f == null then fail("mlt_consumer_get_frame")
+    new Frame(f)
+  }
+
+  /** Stop once the input runs out, rather than sitting on its last frame forever. This is what makes
+    * [[isStopped]] a usable end condition when exporting. */
+  def terminateOnPause: Boolean            = getInt("terminate_on_pause") != 0
+  def terminateOnPause_=(v: Boolean): Unit = setInt("terminate_on_pause", if v then 1 else 0)
+
+  /** How a module consumer paces itself: 1 asynchronous with frame dropping (MLT's default), -1
+    * asynchronous without dropping, 0 synchronous. An export wants 0 — dropping frames to keep pace
+    * with a clock is exactly wrong when there is no clock to keep pace with.
+    *
+    * Read once by [[start]], so set it before. Inert on a bare consumer, whose `start` is a no-op and
+    * which therefore has no render threads to pace. */
+  def realTime: Int            = getInt("real_time")
+  def realTime_=(v: Int): Unit = setInt("real_time", v)
+
+  /** The format a module consumer's render threads decode into (MLT defaults to `yuv422`). Setting it
+    * to the format the frames will actually be used in moves the conversion onto a render thread.
+    *
+    * Inert on a bare consumer: with no render threads, the format is settled by what
+    * [[Frame.imagePtr]] asks for. */
+  def imageFormat: ImageFormat            = get("mlt_image_format").fold(ImageFormat.None)(ImageFormat.named)
+  def imageFormat_=(f: ImageFormat): Unit = set("mlt_image_format", f.name)
+
+  /** How many frames a module consumer's read-ahead buffer holds. Inert on a bare consumer. */
+  def buffer: Int            = getInt("buffer")
+  def buffer_=(v: Int): Unit = setInt("buffer", v)
+
+  /** The number of frames a module consumer has dropped since starting — how far behind the clock it
+    * has fallen. */
+  def dropCount: Int = getInt("drop_count")
+
+  override protected def destroy(): Unit = lib.mlt_consumer_close(ptr)
+
+object Consumer:
+  /** Construct a consumer from a named module — "sdl2" to render to a window, "avformat" to encode
+    * to `resource` as a file, "null" to pull and discard. Throws if no module can handle it. */
+  def apply(profile: Profile, service: String, resource: Option[String] = scala.None): Consumer = Zone {
+    val res = resource.map(toCString(_)).getOrElse(null)
+    val c   = lib.mlt_factory_consumer(profile.ptr, toCString(service), res)
+
+    if c == null then throw new MltException(s"mlt: no consumer for service '$service'")
+    new Consumer(c)
+  }
+
+  /** A consumer with no output of its own — it pulls frames and hands them over, and does nothing
+    * else with them. This is the one an application that draws video itself wants, and the only way
+    * to get the frames: a module consumer's own threads would be competing for them.
+    *
+    * It renders synchronously, on whatever thread calls [[Consumer.rtFrame]], and has no clock — MLT
+    * paces playback inside the module consumers that own an output, so a bare one runs as fast as it
+    * is asked to. Both the frame timing and any decode-ahead are therefore the application's own to
+    * arrange, which is the right division anyway: a decode thread the application created is a thread
+    * the Scala Native runtime knows about, and MLT's render threads are not. */
+  def bare(profile: Profile): Consumer =
+    val c = lib.mlt_consumer_new(profile.ptr)
+
+    if c == null then throw new MltException("mlt: mlt_consumer_new failed")
+    new Consumer(c)
+
 /** A single rendered frame. Obtain one from [[Service.frame]]; it must be closed. */
 class Frame private[mlt] (ptr: lib.mlt_frame) extends Properties(ptr):
 
   /** This frame's position, as a frame number. */
   def position: Int = guard(lib.mlt_frame_get_position(ptr))
+
+  /** The rate the producer was playing at when this frame was made: 1.0 normal, negative reverse,
+    * and **zero once the producer has run out of material**.
+    *
+    * That last case is how a pull loop knows to stop, since running off the end of a producer does
+    * not fail: it goes on yielding perfectly good frames, repeating the final one indefinitely. MLT
+    * advances the producer after making each frame, so the first frame reporting `speed == 0` is one
+    * produced *past* the end — a duplicate of the last real frame, to be discarded rather than shown.
+    *
+    * (A frame whose image is never rendered reports the terminal speed one frame earlier, on the last
+    * real frame instead of the repeat. Loops that draw or encode what they pull — which is all of
+    * them — see the behaviour described above.) */
+  def speed: Double = getDouble("_speed")
 
   /** Render this frame's image and expose the pixels in place — no copy. The returned pointer is
     * owned by the frame and stays valid only until the frame is closed.
@@ -266,9 +409,15 @@ object ImageFormat:
 
   private[mlt] def of(v: Int): ImageFormat = v
 
+  /** The format a name denotes, e.g. "rgba" — the spelling MLT's own string properties use. */
+  def named(name: String): ImageFormat = Zone(lib.mlt_image_format_id(toCString(name)))
+
 extension (f: ImageFormat)
   /** The `mlt_image_format` integer this maps to. */
   def value: Int = f
+
+  /** MLT's own name for this format, e.g. "rgba" — what to write when setting it as a property. */
+  def name: String = fromCString(lib.mlt_image_format_name(f))
 
   /** Bytes per pixel, for the packed formats where that is meaningful. */
   def bytesPerPixel: Int = f match

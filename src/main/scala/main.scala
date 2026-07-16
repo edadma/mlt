@@ -15,6 +15,8 @@ import java.io.FileOutputStream
 
   synthetic(profile)
   mediaFile(profile)
+  playback(profile)
+  exportFile(profile)
   swizzle()
 
   profile.close()
@@ -57,6 +59,73 @@ def mediaFile(profile: Profile): Unit =
   println(s"  wrote mlt-demo.ppm")
 
   frame.close()
+  producer.close()
+
+// The preview path: a bare consumer pulls the clip through frame by frame, the way a video pane would
+// drive it from a thread of its own. Nothing here paces the loop, so it runs flat out — real playback
+// would rate-limit to the profile's fps.
+def playback(profile: Profile): Unit =
+  val producer = Producer(profile, "demo.mp4")
+  val consumer = Consumer.bare(profile)
+
+  consumer.connect(producer)
+  consumer.start()
+
+  val started   = System.nanoTime()
+  var positions = List.empty[Int]
+  var running   = true
+
+  while running do
+    val frame = consumer.rtFrame().getOrElse(throw new MltException("consumer produced nothing"))
+
+    // Pulling a frame does not decode it — the image is rendered on demand, so this is where a
+    // preview's real per-frame cost lives, and a loop that skipped it would be timing nothing.
+    val (_, w, h, fmt) = frame.imagePtr(ImageFormat.Rgba)
+
+    if positions.isEmpty then println(s"\npreview: pulling ${w}x$h ${fmt.name}")
+
+    // Zero speed means the producer has run out and this frame is a repeat of the last real one, so
+    // it is the end of the loop and not a frame to show. Nothing else marks the end: the pull would
+    // go on succeeding forever.
+    running = frame.speed != 0
+
+    if running then positions = frame.position :: positions
+
+    frame.close()
+
+  val elapsed = (System.nanoTime() - started) / 1e6
+  val seen    = positions.reverse
+
+  println(s"  showed ${seen.length} frames in ${elapsed.toInt}ms (${(seen.length / (elapsed / 1000)).toInt} fps)")
+  println(s"  positions ${seen.head}..${seen.last}, in order: ${seen == seen.sorted}, no repeats: ${seen.distinct == seen}")
+  println(s"  clip is ${producer.length} frames, out=${producer.out}")
+
+  consumer.stop()
+  consumer.close()
+  producer.close()
+
+// The other kind of consumer: one that drives itself. An export is not a pull loop — connect it,
+// start it, and wait for it to run out of input.
+def exportFile(profile: Profile): Unit =
+  val path     = "mlt-export.mp4"
+  val producer = Producer(profile, "demo.mp4")
+  val consumer = Consumer(profile, "avformat", Some(path))
+
+  // Without this it would sit on the last frame forever rather than finishing.
+  consumer.terminateOnPause = true
+  consumer.realTime = 0 // encode every frame; never drop one to keep up with a clock
+
+  consumer.connect(producer)
+  consumer.start()
+
+  val started = System.nanoTime()
+
+  while !consumer.isStopped do Thread.sleep(5)
+
+  println(f"\nexport: wrote $path in ${(System.nanoTime() - started) / 1e6}%.0fms")
+
+  consumer.stop()
+  consumer.close()
   producer.close()
 
 // The swizzle is what every frame must pass through to reach a Cairo surface, so prove the channel
