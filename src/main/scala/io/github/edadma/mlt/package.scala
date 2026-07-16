@@ -1,5 +1,6 @@
 package io.github.edadma.mlt
 
+import scala.annotation.targetName
 import scala.io.Source
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
@@ -836,9 +837,60 @@ class Frame private[mlt] (ptr: lib.mlt_frame) extends Properties(ptr):
     (!buf, !w, !h, ImageFormat.of(!fmt))
   }
 
+  /** Render this frame's image and describe it plane by plane — no copy, and the path for handing
+    * video to a GPU.
+    *
+    * A planar format keeps each component in its own run of memory rather than interleaving them:
+    * [[ImageFormat.Yuv420p]] is a full-resolution plane of luma followed by two half-size planes of
+    * chroma. That is what a video decoder produces and what a graphics API takes for a video
+    * texture, and uploading it as-is lets the GPU do the conversion to RGB while it draws — which
+    * is why this, and not [[imagePtr]], is the preview path. Converting to [[ImageFormat.Rgba]] on
+    * the CPU first would cost a full pass over every frame, and a second one to reorder the
+    * channels for a drawing surface (see [[rgbaToArgb32]]).
+    *
+    * The packed formats are simply one-plane images here, so this describes any format MLT renders.
+    * For [[ImageFormat.Yuv420p]] the planes are Y, U, V in that order.
+    *
+    * The pointers belong to the frame and die with it, exactly as [[imagePtr]]'s do. `format` is a
+    * request and the result reports what was actually produced. */
+  def imagePlanes(format: ImageFormat = ImageFormat.Yuv420p): ImagePlanes = guard {
+    val (buf, w, h, actual) = imagePtr(format)
+    val img                 = lib.mlt_image_new()
+
+    if img == null then throw new MltException("mlt: could not allocate an image description")
+    try
+      // Borrows the buffer — it stores the pointer and nulls the destructor — so closing the
+      // description below leaves the frame's pixels alone.
+      lib.mlt_image_set_values(img, buf, actual.value, w, h)
+
+      val planes  = img._5
+      val strides = img._6
+      val out = (0 until 4).iterator
+        .map(i => Plane(!planes.at(i), !strides.at(i)))
+        .takeWhile(_.data != null)
+        .toIndexedSeq
+
+      ImagePlanes(w, h, actual, out)
+    finally lib.mlt_image_close(img)
+  }
+
+  /** The Y'CbCr standard this frame's values are encoded against.
+    *
+    * Every frame reports one, including frames nothing decoded: MLT renders a graph against its
+    * profile's colorspace, so even a generated picture comes back carrying it. Anything converting
+    * this frame's colour — a GPU that is handed [[imagePlanes]] to convert while drawing — needs it,
+    * and getting it wrong is not an error, only a picture whose colours are quietly off. */
+  def colorspace: Colorspace = Colorspace.of(getInt("colorspace"))
+
+  /** Whether the picture uses the full 0..255 per component rather than video's studio range, which
+    * keeps 16..235 for luma and reserves the rest as headroom. The other half of interpreting the
+    * values — the same numbers mean different colours under each. */
+  def fullRange: Boolean = getInt("full_range") != 0
+
   /** Render this frame's image into a fresh Scala array — a self-contained copy that outlives the
     * frame. Only the packed formats ([[ImageFormat.Rgb]], [[ImageFormat.Rgba]]) are supported here,
-    * since a planar YUV layout has no single meaningful stride to copy against. */
+    * since a planar YUV layout has no single meaningful stride to copy against — use
+    * [[imagePlanes]] for those. */
   def image(format: ImageFormat = ImageFormat.Rgba): Image =
     val (buf, w, h, actual) = imagePtr(format)
     val size                = w * h * actual.bytesPerPixel
@@ -864,6 +916,11 @@ class Profile private[mlt] (private[mlt] val ptr: lib.mlt_profile) extends MltRe
   def width: Int           = guard(ptr._4)
   def height: Int          = guard(ptr._5)
   def progressive: Boolean = guard(ptr._6 != 0)
+
+  /** The Y'CbCr standard this graph renders against. Every frame it produces carries this, whether
+    * or not anything decoded one — which is what makes it answerable before a frame exists, as
+    * something that must size and configure a video surface up front needs. */
+  def colorspace: Colorspace = guard(Colorspace.of(ptr._11))
 
   /** Frame rate as a single number — `frameRateNum / frameRateDen`. */
   def fps: Double = guard(lib.mlt_profile_fps(ptr))
@@ -904,7 +961,12 @@ object Profile:
   *
   * Note what is *absent*: MLT has no BGRA. [[ImageFormat.Rgba]] is byte order R,G,B,A, while Cairo's
   * ARGB32 is native-endian and so wants B,G,R,A in memory on a little-endian machine. Painting an MLT
-  * frame through Cairo therefore costs a channel swap — see [[rgbaToArgb32]]. */
+  * frame through Cairo therefore costs a channel swap — see [[rgbaToArgb32]].
+  *
+  * That cost is a reason to avoid drawing video through Cairo at all rather than a reason to pay it:
+  * a graphics API that takes [[Yuv420p]] through [[Frame.imagePlanes]] converts the frame while it
+  * draws it, so nothing on the CPU touches the pixels. Keep the packed formats for stills and for
+  * pixels being inspected; give moving video to the GPU planar. */
 opaque type ImageFormat = Int
 
 object ImageFormat:
@@ -940,6 +1002,81 @@ extension (f: ImageFormat)
 
 /** A rendered image copied out of a frame: its size, its packed pixels, and their layout. */
 final case class Image(width: Int, height: Int, pixels: Array[Byte], format: ImageFormat)
+
+/** One component plane of a rendered image: where its first byte is, and how many bytes one row of
+  * it occupies.
+  *
+  * `stride` is not the same as the plane's width in bytes, and must not be assumed to be: a row can
+  * be followed by padding so the next one starts on an alignment a decoder or a GPU prefers. Walk a
+  * plane by adding `stride` per row, never by multiplying out the width. */
+final case class Plane(data: Ptr[Byte], stride: Int)
+
+/** A frame's rendered image described plane by plane — see [[Frame.imagePlanes]].
+  *
+  * `planes` holds only the planes this format actually uses, in the order the format defines them:
+  * three for [[ImageFormat.Yuv420p]] (Y, U, V), one for a packed format like [[ImageFormat.Rgba]],
+  * whose single plane is the whole interleaved image.
+  *
+  * `width` and `height` describe the *image*. A subsampled chroma plane is smaller than that — half
+  * on each axis for 4:2:0 — so its own extent is the image's scaled down, and its rows are found
+  * through its own [[Plane.stride]].
+  *
+  * The pointers are borrowed from the frame and are valid only while it is open. */
+final case class ImagePlanes(width: Int, height: Int, format: ImageFormat, planes: IndexedSeq[Plane])
+
+/** The Y'CbCr standard a picture's values are encoded against — an `mlt_colorspace` value.
+  *
+  * Luma and chroma are not colours by themselves; they become colours through a set of coefficients,
+  * and this says which set. Its numbers are mostly the standards' own — 709, 601, 2020 — rather than
+  * a dense enumeration, so treat it as a tag and compare against the named values here.
+  *
+  * The distinction that matters in practice is HD versus SD: [[Bt709]] is essentially all HD video,
+  * while [[Bt601]], [[Bt470bg]] (625-line PAL), [[Smpte170m]] (525-line NTSC) and [[Smpte240m]] are
+  * the SD family and share its coefficients. Something choosing between two conversions wants to
+  * treat that whole family alike. */
+opaque type Colorspace = Int
+
+object Colorspace:
+  /** Coefficients for RGB itself — the values are already colour, in G,B,R order. */
+  val Rgb: Colorspace = 0
+
+  /** The source declared nothing. MLT resolves this to a standard by picture height when it must. */
+  val Unspecified: Colorspace = 2
+  val Reserved: Colorspace    = 3
+  val Fcc: Colorspace         = 4
+  val Ycgco: Colorspace       = 8
+  val Smpte2085: Colorspace   = 11
+
+  /** 525-line NTSC — the SD family, same coefficients as [[Bt601]]. */
+  val Smpte170m: Colorspace = 170
+
+  /** Functionally identical to [[Smpte170m]]. */
+  val Smpte240m: Colorspace = 240
+
+  /** 625-line PAL and SECAM — the SD family, same coefficients as [[Bt601]]. */
+  val Bt470bg: Colorspace = 470
+
+  /** Standard-definition video. */
+  val Bt601: Colorspace = 601
+
+  /** High-definition video — what an HD file almost always is. */
+  val Bt709: Colorspace = 709
+
+  val Bt2020Ncl: Colorspace = 2020
+  val Bt2020Cl: Colorspace  = 2021
+
+  private[mlt] def of(v: Int): Colorspace = v
+
+// Colorspace and ImageFormat are both opaque over Int, so their extensions erase to the same
+// signatures and need distinct names on the JVM side of the fence.
+extension (c: Colorspace)
+  /** The `mlt_colorspace` integer this maps to. */
+  @targetName("colorspaceValue")
+  def value: Int = c
+
+  /** MLT's own name for this standard, e.g. "bt709". */
+  @targetName("colorspaceName")
+  def name: String = fromCString(lib.mlt_image_colorspace_name(c))
 
 /** Rewrite `count` pixels of MLT's [[ImageFormat.Rgba]] output, in place, into the byte order Cairo's
   * ARGB32 expects on a little-endian machine — swapping the red and blue channels.

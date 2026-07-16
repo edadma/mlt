@@ -15,6 +15,7 @@ import java.io.FileOutputStream
 
   synthetic(profile)
   mediaFile(profile)
+  planes(profile)
   playback(profile)
   exportFile(profile)
   timeline(profile)
@@ -62,6 +63,28 @@ def mediaFile(profile: Profile): Unit =
 
   writePpm("mlt-demo.ppm", img)
   println(s"  wrote mlt-demo.ppm")
+
+  frame.close()
+  producer.close()
+
+// The same frame, described plane by plane rather than packed — how a preview hands video to a GPU.
+// A video texture takes these pointers as they are and converts to RGB while it draws, so nothing on
+// the CPU ever walks the pixels; that is what makes a full-rate preview cheap, and it is why the
+// channel swap `swizzle` demonstrates is a last resort rather than the plan.
+def planes(profile: Profile): Unit =
+  val producer = Producer(profile, "demo.mp4")
+
+  producer.seek(producer.length / 2)
+
+  val frame = producer.frame()
+  val p     = frame.imagePlanes()
+
+  println(s"\nplanar: ${p.format.name} ${p.width}x${p.height}, ${p.planes.length} planes")
+
+  // Y is full size; the two chroma planes are half of it on each axis, which their strides show.
+  for (plane, i) <- p.planes.zipWithIndex do println(s"  plane $i: stride ${plane.stride}")
+
+  println(s"  colour: ${frame.colorspace.name}, ${if frame.fullRange then "full" else "studio"} range")
 
   frame.close()
   producer.close()

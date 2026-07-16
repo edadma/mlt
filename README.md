@@ -5,9 +5,10 @@ authoring framework that powers Shotcut, Kdenlive, and Flowblade.
 
 > **Status:** early, but it edits, plays, encodes, saves and reopens real video. The framework
 > lifecycle, profiles, the property bag, producers (including `avformat` media files), frame
-> rendering, consumers, playlists, filters, transitions, multitrack tractors, and MLT XML projects
-> all work — `sbt run` assembles a timeline, composites two tracks, decodes a clip frame by frame,
-> transcodes it to H.264, and saves a project that reopens as the same graph.
+> rendering (packed or planar, for a GPU), consumers, playlists, filters, transitions, multitrack
+> tractors, and MLT XML projects all work — `sbt run` assembles a timeline, composites two tracks,
+> decodes a clip frame by frame, transcodes it to H.264, and saves a project that reopens as the
+> same graph.
 
 ## Requirements
 
@@ -290,7 +291,7 @@ answer, which is exactly what loading a project by path does to its root.
 `Producer.asTractor` therefore examines the object instead of asking it: only a tractor carries the
 multitrack it combines, so looking for that answers the question whatever the label says.
 
-### Pixel formats, and the one unavoidable copy
+### Pixel formats, and how not to copy
 
 MLT's `mlt_image_format` offers only `rgb` and `rgba` — byte order R,G,B,A. There is **no BGRA**.
 Cairo's `ARGB32` is native-endian, so on a little-endian machine it wants B,G,R,A in memory.
@@ -298,6 +299,29 @@ Cairo's `ARGB32` is native-endian, so on a little-endian machine it wants B,G,R,
 That matters because an image codec can usually be *asked* for a given layout and made to write
 straight into a target surface. MLT cannot, so painting a frame through Cairo costs a channel swap.
 `rgbaToArgb32` does it in place, a 32-bit word at a time — at 1080p30 that path moves ~250 MB/s.
+
+Which is a good reason not to paint video through Cairo at all. A decoder does not produce RGB in the
+first place: it produces planar YUV, and asking for `rgba` buys a colourspace conversion whose result
+then needs the swap above. `frame.imagePlanes()` gives the frame in its own layout instead —
+
+```scala
+val p = frame.imagePlanes() // yuv420p by default
+val Seq(y, u, v) = p.planes
+
+texture.update(y.data, y.stride, u.data, u.stride, v.data, v.stride)
+```
+
+— three pointers into the frame's own buffer, uploaded as they are. A GPU converts YUV to RGB in the
+blit's shader, for free, while it draws. Nothing on the CPU touches the pixels. Use the packed formats
+for stills and for pixels being inspected; give moving video to the GPU planar.
+
+Two details that path needs. `stride` is bytes per row and is **not** the plane's width — rows can be
+padded, so walk a plane by adding `stride`, never by multiplying out the width. And whoever converts
+the colour needs to know which coefficients to use: `frame.colorspace` and `frame.fullRange` say, and
+`profile.colorspace` answers the same question before any frame exists, for something that must
+configure a video surface up front. Every frame carries it, including frames nothing decoded — MLT
+renders a graph against its profile's colorspace, so a generated picture reports one too. Getting it
+wrong is not an error, just a picture whose colours are quietly off.
 
 Note also that MLT renders letterbox/pillarbox padding as **transparent** black (alpha 0) while the
 picture itself is alpha 255 — so a surface receiving a frame should be cleared to a known colour

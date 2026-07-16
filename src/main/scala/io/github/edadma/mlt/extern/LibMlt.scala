@@ -480,5 +480,56 @@ object LibMlt:
   /** The `mlt_image_format` a name denotes — the inverse of [[mlt_image_format_name]]. */
   def mlt_image_format_id(name: CString): CInt = extern
 
+  /** `mlt_image_s` — a described image: its layout, its size, and where each plane starts.
+    *
+    * Bound as a struct rather than an opaque pointer because reading `planes` and `strides` is the
+    * entire reason to hold one: they are what a planar format's picture is addressed through, and
+    * MLT publishes them as fields rather than through accessors. The trailing four members are
+    * function pointers to destructors, which this binding never sets and never calls, so they are
+    * modelled as plain pointers.
+    *
+    * Field order: format, width, height, colorspace, planes[4], strides[4], data, release_data,
+    * alpha, release_alpha, close. */
+  type mlt_image_s = CStruct11[
+    CInt,                      // format — an mlt_image_format
+    CInt,                      // width
+    CInt,                      // height
+    CInt,                      // colorspace
+    CArray[Ptr[Byte], Nat._4], // planes — first byte of each; unused planes are null
+    CArray[CInt, Nat._4],      // strides — bytes per row of each plane
+    Ptr[Byte],                 // data — the whole buffer the planes point into
+    Ptr[Byte],                 // release_data — destructor, or null when the data is borrowed
+    Ptr[Byte],                 // alpha
+    Ptr[Byte],                 // release_alpha
+    Ptr[Byte],                 // close
+  ]
+
+  type mlt_image = Ptr[mlt_image_s]
+
+  /** Allocate an empty image description. It owns no pixels until told about some. */
+  def mlt_image_new(): mlt_image = extern
+
+  /** Describe `data` as an image of `format` at `width` x `height`, filling in `planes` and
+    * `strides` for that layout.
+    *
+    * **It borrows the buffer**: it stores the pointer and sets `release_data` to null, so closing
+    * the image will not free the pixels. That is what makes it safe to point at a frame's own
+    * buffer, which the frame owns and frees. It does not consult the previous contents of the
+    * struct, so it is equally safe on a freshly allocated one. */
+  def mlt_image_set_values(
+      self: mlt_image,
+      data: Ptr[Byte],
+      format: CInt,
+      width: CInt,
+      height: CInt,
+  ): Unit = extern
+
+  /** Release an image description. Frees the pixels only if the image owns them, which one filled
+    * in by [[mlt_image_set_values]] does not. */
+  def mlt_image_close(self: mlt_image): Unit = extern
+
+  /** The name of an `mlt_colorspace` — "bt709", "bt601", and so on. Returns a static string. */
+  def mlt_image_colorspace_name(colorspace: CInt): CString = extern
+
   /** Release a frame obtained from [[mlt_service_get_frame]]. */
   def mlt_frame_close(self: mlt_frame): Unit = extern
