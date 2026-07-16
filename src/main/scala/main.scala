@@ -1,5 +1,6 @@
 import io.github.edadma.mlt.*
 
+import scala.scalanative.unsafe.*
 import java.io.FileOutputStream
 
 // Exercises the binding end to end: the framework starts, a profile resolves, both a synthetic and a
@@ -16,6 +17,7 @@ import java.io.FileOutputStream
   synthetic(profile)
   mediaFile(profile)
   planes(profile)
+  audio(profile)
   playback(profile)
   exportFile(profile)
   timeline(profile)
@@ -87,6 +89,48 @@ def planes(profile: Profile): Unit =
   println(s"  colour: ${frame.colorspace.name}, ${if frame.fullRange then "full" else "studio"} range")
 
   frame.close()
+  producer.close()
+
+// The audio path: pull a frame and read its samples. `tone.mp4` carries a known 440Hz sine, so the
+// samples must be real — non-zero and within the float range — rather than silence or garbage. That
+// peak-amplitude check is what proves the buffer is the sound and not merely plausible bytes, the
+// same way the planar-video probe proves its planes are the picture.
+def audio(profile: Profile): Unit =
+  val producer = Producer(profile, "tone.mp4")
+  val consumer = Consumer.bare(profile)
+
+  consumer.connect(producer)
+  consumer.start()
+
+  // Pull frames in sequence — the way playback does — reading each frame's audio and tracking the
+  // loudest sample seen. A decoder primes over the first frames, so scanning several is what tells a
+  // priming delay apart from silence.
+  var maxPeak    = 0.0f
+  var firstFrame = -1
+  var freq       = 0
+  var chans      = 0
+  var samps      = 0
+
+  for f <- 0 until 20 do
+    val frame = consumer.rtFrame().getOrElse(throw new MltException("consumer produced nothing"))
+    val a     = frame.audio(profile.fps)
+    freq = a.frequency; chans = a.channels; samps = a.samples
+
+    val floats = a.buffer.asInstanceOf[Ptr[Float]]
+    val n      = a.samples * a.channels
+    var i      = 0
+    while i < n do
+      val s = math.abs(floats(i))
+      if s > maxPeak then maxPeak = s
+      if s > 0.0f && firstFrame < 0 then firstFrame = f
+      i += 1
+    frame.close()
+
+  println(s"\naudio: ${freq}Hz ${chans}ch, ${samps} samples/ch, format f32le")
+  println(s"  peak amplitude over 20 frames: $maxPeak (first audible at frame $firstFrame)")
+
+  consumer.stop()
+  consumer.close()
   producer.close()
 
 // The preview path: a bare consumer pulls the clip through frame by frame, the way a video pane would

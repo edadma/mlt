@@ -887,6 +887,43 @@ class Frame private[mlt] (ptr: lib.mlt_frame) extends Properties(ptr):
     * values — the same numbers mean different colours under each. */
   def fullRange: Boolean = getInt("full_range") != 0
 
+  /** Render this frame's audio and expose the samples in place — no copy. The returned pointer is
+    * owned by the frame and stays valid only until the frame is closed, exactly like [[imagePtr]]'s.
+    *
+    * MLT resamples the source to `frequency` Hz and `channels` channels and hands the result back in
+    * `format` — the default [[AudioFormat.F32le]] is 32-bit interleaved float, one buffer of
+    * `samples * channels` values with the channels interleaved sample by sample, which is what an
+    * audio device typically takes.
+    *
+    * `fps` is the graph's frame rate: it sets how many samples belong to this frame, which varies
+    * frame to frame when the sample rate does not divide evenly by the frame rate and is computed
+    * exactly here from the frame's position. **This must be asked for a non-zero count** — MLT
+    * returns silence for a request of zero samples, which is why the sample count is not left to a
+    * default. A frame that genuinely has no audio comes back with `samples == 0`. */
+  def audio(
+      fps:       Double,
+      frequency: Int         = 48000,
+      channels:  Int         = 2,
+      format:    AudioFormat = AudioFormat.F32le,
+  ): Audio = guard {
+    val buf  = stackalloc[Ptr[Byte]]()
+    val fmt  = stackalloc[CInt]()
+    val freq = stackalloc[CInt]()
+    val chan = stackalloc[CInt]()
+    val samp = stackalloc[CInt]()
+
+    // frequency/channels/samples are in/out — MLT reads them as the request before writing back what
+    // it produced. The sample count is the one that must be right: it is this frame's share of the
+    // stream at `fps`/`frequency`, and a zero request comes back silent.
+    !fmt  = format.value
+    !freq = frequency
+    !chan = channels
+    !samp = lib.mlt_audio_calculate_frame_samples(fps.toFloat, frequency, position.toLong)
+
+    if lib.mlt_frame_get_audio(ptr, buf, fmt, freq, chan, samp) != 0 then fail("mlt_frame_get_audio")
+    Audio(!buf, AudioFormat.of(!fmt), !freq, !chan, !samp)
+  }
+
   /** Render this frame's image into a fresh Scala array — a self-contained copy that outlives the
     * frame. Only the packed formats ([[ImageFormat.Rgb]], [[ImageFormat.Rgba]]) are supported here,
     * since a planar YUV layout has no single meaningful stride to copy against — use
@@ -1023,6 +1060,50 @@ final case class Plane(data: Ptr[Byte], stride: Int)
   *
   * The pointers are borrowed from the frame and are valid only while it is open. */
 final case class ImagePlanes(width: Int, height: Int, format: ImageFormat, planes: IndexedSeq[Plane])
+
+/** A frame's rendered audio — see [[Frame.audio]].
+  *
+  * `buffer` points at the samples, owned by the frame and valid only while it is open. `format` says
+  * how they are laid out; the default [[AudioFormat.F32le]] is 32-bit interleaved float, so the
+  * buffer holds `samples * channels` values with the channels interleaved sample by sample (L, R, L,
+  * R, … for stereo). `frequency` is the sample rate in Hz, `channels` the channel count, and
+  * `samples` the number of samples per channel. A frame with no audio has `samples == 0`. */
+final case class Audio(buffer: Ptr[Byte], format: AudioFormat, frequency: Int, channels: Int, samples: Int)
+
+/** An `mlt_audio_format` — how a frame's audio samples are laid out. Treat it as a tag; the value
+  * you usually ask for is [[F32le]] (32-bit interleaved float), which is what an audio device takes.
+  * The interleaved formats pack the channels sample by sample; the non-interleaved ones keep each
+  * channel in its own run. */
+opaque type AudioFormat = Int
+
+object AudioFormat:
+  /** Audio not available. */
+  val None: AudioFormat = 0
+
+  /** Signed 16-bit interleaved PCM. */
+  val S16: AudioFormat = 1
+
+  /** Signed 32-bit non-interleaved PCM. */
+  val S32: AudioFormat = 2
+
+  /** 32-bit non-interleaved floating point. */
+  val Float: AudioFormat = 3
+
+  /** Signed 32-bit interleaved PCM. */
+  val S32le: AudioFormat = 4
+
+  /** 32-bit interleaved floating point — the usual choice for playback. */
+  val F32le: AudioFormat = 5
+
+  /** Unsigned 8-bit interleaved PCM. */
+  val U8: AudioFormat = 6
+
+  private[mlt] def of(v: Int): AudioFormat = v
+
+extension (f: AudioFormat)
+  /** The `mlt_audio_format` integer this maps to. */
+  @targetName("audioFormatValue")
+  def value: Int = f
 
 /** The Y'CbCr standard a picture's values are encoded against — an `mlt_colorspace` value.
   *

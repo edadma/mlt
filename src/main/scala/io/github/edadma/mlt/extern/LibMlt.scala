@@ -477,6 +477,27 @@ object LibMlt:
 
   def mlt_frame_get_position(self: mlt_frame): mlt_position = extern
 
+  /** Render this frame's audio and hand back a pointer to the samples, owned by the frame and valid
+    * until it is closed. `format` is in/out like [[mlt_frame_get_image]]: pass the desired
+    * `mlt_audio_format` and MLT converts, writing back what it produced. `frequency` receives the
+    * sample rate in Hz, `channels` the channel count, and `samples` the number of samples per
+    * channel (so an interleaved buffer holds `samples * channels` values). Returns 0 on success. */
+  def mlt_frame_get_audio(
+      self: mlt_frame,
+      buffer: Ptr[Ptr[Byte]],
+      format: Ptr[CInt],
+      frequency: Ptr[CInt],
+      channels: Ptr[CInt],
+      samples: Ptr[CInt],
+  ): CInt = extern
+
+  /** The number of audio samples that belong to the frame at `position`, for a graph running at
+    * `fps` with audio at `frequency` Hz. Because the sample rate rarely divides evenly by the frame
+    * rate, this varies frame to frame (1601, then 1601, then 1602, …); it accumulates against the
+    * position so the counts stay exact over time. [[mlt_frame_get_audio]] must be asked for this
+    * many samples — a request of 0 yields silence. */
+  def mlt_audio_calculate_frame_samples(fps: CFloat, frequency: CInt, position: CLongLong): CInt = extern
+
   // -- Image formats ---------------------------------------------------------------------------
 
   /** The name of an `mlt_image_format` — "rgba", "yuv422", and so on. This is the spelling MLT's
