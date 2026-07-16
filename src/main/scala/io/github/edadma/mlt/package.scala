@@ -94,8 +94,15 @@ class Properties private[mlt] (private[mlt] val ptr: lib.mlt_properties) extends
 
   protected def destroy(): Unit = lib.mlt_properties_close(ptr)
 
+/** Wrap a pointer reached *through* the graph rather than returned by a factory. MLT still owns it,
+  * so take a reference of our own: that is what lets the wrapper be closed on its own schedule
+  * without the graph losing the object, and keeps the one-reference-per-wrapper rule intact. */
+private def borrowed[A](ptr: lib.mlt_properties)(wrap: lib.mlt_properties => A): A =
+  lib.mlt_properties_inc_ref(ptr)
+  wrap(ptr)
+
 /** A node in a rendering graph — the base of producers, filters, transitions, and consumers. What a
-  * service can do generically is hand out frames. */
+  * service can do generically is hand out frames, and have filters attached to it. */
 class Service private[mlt] (ptr: lib.mlt_service) extends Properties(ptr):
 
   /** Render the next frame from this service. The returned frame belongs to the caller and must be
@@ -108,6 +115,36 @@ class Service private[mlt] (ptr: lib.mlt_service) extends Properties(ptr):
     if !out == null then fail("mlt_service_get_frame returned no frame")
     new Frame(!out)
   }
+
+  /** Attach a filter, so every frame this service produces passes through it. Attaching is
+    * independent of the wrapper's lifetime — the service takes its own reference, so the filter may
+    * be closed here and goes on filtering.
+    *
+    * Filters apply in the order attached. Attach to a clip's producer to affect that clip, or to a
+    * playlist to affect the whole track. */
+  def attach(filter: Filter): Unit =
+    guard(if lib.mlt_service_attach(ptr, filter.ptr) != 0 then fail("mlt_service_attach"))
+
+  /** Remove a filter attached to this service. */
+  def detach(filter: Filter): Unit =
+    guard(if lib.mlt_service_detach(ptr, filter.ptr) != 0 then fail("mlt_service_detach"))
+
+  /** How many filters are attached — including ones the caller never attached. A producer built
+    * through the "loader" arrives with MLT's format-conversion filters already on it, and they are
+    * attached filters like any other; expect a count in double figures on a fresh producer. */
+  def filterCount: Int = guard(lib.mlt_service_filter_count(ptr))
+
+  /** The attached filter at `index`, as a wrapper of its own that must be closed. */
+  def filterAt(index: Int): Filter = guard {
+    val f = lib.mlt_service_filter(ptr, index)
+
+    if f == null then throw new MltException(s"mlt: no filter at index $index")
+    borrowed(f)(new Filter(_))
+  }
+
+  /** Reorder the attached filters, which is to reorder how they apply. */
+  def moveFilter(from: Int, to: Int): Unit =
+    guard(if lib.mlt_service_move_filter(ptr, from, to) != 0 then fail("mlt_service_move_filter"))
 
 /** Anything that produces frames over a timeline — a media file, a generated colour, a playlist, a
   * multitrack tractor.
@@ -143,9 +180,16 @@ class Producer private[mlt] (ptr: lib.mlt_producer) extends Service(ptr):
   override protected def destroy(): Unit = lib.mlt_producer_close(ptr)
 
 object Producer:
-  /** Construct a producer for `resource` — a file path, or a service-specific string such as "red"
-    * for the "color" service. `service` names the module to use ("avformat" for media files, "color"
-    * for a solid); omit it to let MLT choose by inspecting the resource.
+  /** Construct a producer for `resource` — a file path, or a service-specific string such as
+    * "color:red" for a solid.
+    *
+    * **Omit `service` unless you have a reason not to.** Doing so routes construction through MLT's
+    * "loader" producer, which does more than pick a module by looking at the resource: it wraps the
+    * module in MLT's format-conversion filters. Without them, a producer renders whatever format is
+    * asked of it — but only until a filter is attached, because a filter that renders in a format of
+    * its own (greyscale works in `yuv422`) hands that format back regardless of the request, and
+    * nothing is left to convert it. Naming a service is the escape hatch, and it costs the
+    * conversion.
     *
     * Throws if no module can handle the resource. */
   def apply(profile: Profile, resource: String, service: Option[String] = None): Producer = Zone {
@@ -156,6 +200,316 @@ object Producer:
       throw new MltException(s"mlt: no producer for resource '$resource'${service.fold("")(s => s" (service '$s')")}")
     new Producer(p)
   }
+
+/** What a playlist knows about one of its entries — the shape a timeline draws from.
+  *
+  * `start` and `length` place the entry on the playlist; `in` and `out` say which part of the source
+  * it shows. A [[blank]] entry is a gap: it has a start and a length and nothing else.
+  *
+  * This is a snapshot, not a view. Any edit to the playlist invalidates what it says. */
+final case class ClipInfo(
+    index: Int,
+    start: Int,
+    length: Int,
+    in: Int,
+    out: Int,
+    sourceLength: Int,
+    fps: Double,
+    repeat: Int,
+    resource: Option[String],
+    blank: Boolean,
+)
+
+/** A sequence of clips and blanks, played end to end — and a producer in its own right, which is
+  * what makes it a timeline track: an editor's whole track plays as a single continuous piece of
+  * video, and can be filtered, put on a [[Tractor]], or rendered on its own.
+  *
+  * Positions come in two frames of reference, and mixing them up is the easiest mistake to make
+  * here. An *index* numbers the entries, counting blanks; a *position* is a frame number on the
+  * playlist's own timeline. [[clipIndexAt]] converts. */
+class Playlist private[mlt] (ptr: lib.mlt_playlist) extends Producer(ptr):
+
+  /** Append the whole of `producer` as the next entry. */
+  def append(producer: Producer): Unit =
+    guard(if lib.mlt_playlist_append(ptr, producer.ptr) != 0 then fail("mlt_playlist_append"))
+
+  /** Append only `in..out` of `producer` (inclusive frame numbers on the *source*).
+    *
+    * This is a cut, and it does not disturb the producer's own in/out points — so one producer can
+    * appear on a playlist any number of times, each time showing a different part of itself. That is
+    * how an editor puts three pieces of the same clip on a track without opening the file thrice. */
+  def append(producer: Producer, in: Int, out: Int): Unit =
+    guard(if lib.mlt_playlist_append_io(ptr, producer.ptr, in, out) != 0 then fail("mlt_playlist_append_io"))
+
+  /** Append a gap of `length` frames. */
+  def blank(length: Int): Unit =
+    guard(if lib.mlt_playlist_blank(ptr, length - 1) != 0 then fail("mlt_playlist_blank"))
+
+  /** The number of entries, counting blanks. */
+  def count: Int = guard(lib.mlt_playlist_count(ptr))
+
+  def clear(): Unit = guard(if lib.mlt_playlist_clear(ptr) != 0 then fail("mlt_playlist_clear"))
+
+  /** Insert `in..out` of `producer` before entry `index`, shifting the rest later. */
+  def insert(producer: Producer, index: Int, in: Int, out: Int): Unit =
+    guard(if lib.mlt_playlist_insert(ptr, producer.ptr, index, in, out) != 0 then fail("mlt_playlist_insert"))
+
+  /** Remove entry `index`, closing the gap it leaves. */
+  def remove(index: Int): Unit = guard(if lib.mlt_playlist_remove(ptr, index) != 0 then fail("mlt_playlist_remove"))
+
+  /** Move entry `from` to `to`, shifting whatever lies between. */
+  def move(from: Int, to: Int): Unit = guard(if lib.mlt_playlist_move(ptr, from, to) != 0 then fail("mlt_playlist_move"))
+
+  /** Retrim entry `index` to show `in..out` of its source — the edit dragging a clip's edge makes. */
+  def resizeClip(index: Int, in: Int, out: Int): Unit =
+    guard(if lib.mlt_playlist_resize_clip(ptr, index, in, out) != 0 then fail("mlt_playlist_resize_clip"))
+
+  /** Cut entry `index` in two at `position`, counted from that entry's own start — the razor tool. */
+  def split(index: Int, position: Int): Unit =
+    guard(if lib.mlt_playlist_split(ptr, index, position) != 0 then fail("mlt_playlist_split"))
+
+  /** Cut whatever lies under `position` on the playlist. The frame at `position` starts the second
+    * of the two entries. */
+  def splitAt(position: Int): Unit =
+    guard(if lib.mlt_playlist_split_at(ptr, position, 0) != 0 then fail("mlt_playlist_split_at"))
+
+  /** Rejoin `count` entries from `index` back into one, undoing a split. */
+  def join(index: Int, count: Int): Unit =
+    guard(if lib.mlt_playlist_join(ptr, index, count, 0) != 0 then fail("mlt_playlist_join"))
+
+  /** Overlap the last `length` frames of entry `index` with the start of the next, rendering the
+    * overlap through `transition` — a cross-fade. The playlist gets shorter by `length`.
+    *
+    * Without a transition the overlap is a hard cut on the later clip; "luma" wipes, and "mix" is
+    * the audio equivalent. */
+  def mix(index: Int, length: Int, transition: Option[Transition] = scala.None): Unit =
+    guard(
+      if lib.mlt_playlist_mix(ptr, index, length, transition.map(_.ptr).getOrElse(null)) != 0 then
+        fail("mlt_playlist_mix"),
+    )
+
+  /** Everything the playlist knows about entry `index`. */
+  def clipInfo(index: Int): ClipInfo = guard {
+    val info = stackalloc[lib.mlt_playlist_clip_info]()
+
+    if lib.mlt_playlist_get_clip_info(ptr, info, index) != 0 then fail(s"mlt_playlist_get_clip_info($index)")
+
+    // The resource string is borrowed from the entry and dies with the next edit, so copy it out.
+    val resource = if info._5 == null then scala.None else Some(fromCString(info._5))
+
+    ClipInfo(
+      index = info._1,
+      start = info._4,
+      length = info._8,
+      in = info._6,
+      out = info._7,
+      sourceLength = info._9,
+      fps = info._10.toDouble,
+      repeat = info._11,
+      resource = resource,
+      blank = lib.mlt_playlist_is_blank(ptr, index) != 0,
+    )
+  }
+
+  /** Every entry, in order — one pass over the whole track. */
+  def clips: Seq[ClipInfo] = (0 until count).map(clipInfo)
+
+  /** The producer of entry `index`, as a wrapper of its own that must be closed. */
+  def clipAt(index: Int): Producer = guard {
+    val p = lib.mlt_playlist_get_clip(ptr, index)
+
+    if p == null then throw new MltException(s"mlt: no clip at index $index")
+    borrowed(p)(new Producer(_))
+  }
+
+  /** The index of the entry playing at `position` on the playlist. */
+  def clipIndexAt(position: Int): Int = guard(lib.mlt_playlist_get_clip_index_at(ptr, position))
+
+  /** Where entry `index` begins, as a frame number on the playlist. */
+  def clipStart(index: Int): Int = guard(lib.mlt_playlist_clip_start(ptr, index))
+
+  /** How many frames entry `index` occupies on the playlist. */
+  def clipLength(index: Int): Int = guard(lib.mlt_playlist_clip_length(ptr, index))
+
+  /** Whether entry `index` is a gap rather than a clip. */
+  def isBlank(index: Int): Boolean = guard(lib.mlt_playlist_is_blank(ptr, index) != 0)
+
+  def isBlankAt(position: Int): Boolean = guard(lib.mlt_playlist_is_blank_at(ptr, position) != 0)
+
+  /** Fold runs of adjacent blanks into single ones. `keepLength` preserves the playlist's total
+    * length by leaving trailing blanks alone. */
+  def consolidateBlanks(keepLength: Boolean = false): Unit =
+    guard(lib.mlt_playlist_consolidate_blanks(ptr, if keepLength then 1 else 0))
+
+  /** Cut `length` frames out of the playlist at `position`, closing the gap — ripple delete. */
+  def removeRegion(position: Int, length: Int): Unit =
+    guard(if lib.mlt_playlist_remove_region(ptr, position, length) != 0 then fail("mlt_playlist_remove_region"))
+
+  override protected def destroy(): Unit = lib.mlt_playlist_close(ptr)
+
+object Playlist:
+  /** An empty playlist rendering against `profile`. */
+  def apply(profile: Profile): Playlist =
+    val p = lib.mlt_playlist_new(profile.ptr)
+
+    if p == null then throw new MltException("mlt: mlt_playlist_new failed")
+    new Playlist(p)
+
+/** A service that modifies the frames of a single producer — a colour correction, a blur, a fade.
+  *
+  * A filter does nothing until it is attached ([[Service.attach]]) or planted on a track of a
+  * [[Tractor]]. What it does is set by its properties, whose names are the filter module's own.
+  *
+  * Attaching a filter is what first makes a producer's construction matter: a filter renders in
+  * whatever format suits it, and only a producer built through the "loader" — one constructed
+  * without naming a service — carries the conversion filters that put the frame back into the format
+  * the caller asked for. See [[Producer.apply]]. */
+class Filter private[mlt] (ptr: lib.mlt_filter) extends Service(ptr):
+
+  /** Limit the filter to frames `in..out` of what it is attached to — how a filter becomes an
+    * effect that starts and stops. A filter left alone applies throughout. */
+  def setInAndOut(in: Int, out: Int): Unit = guard(lib.mlt_filter_set_in_and_out(ptr, in, out))
+
+  def in: Int     = guard(lib.mlt_filter_get_in(ptr))
+  def out: Int    = guard(lib.mlt_filter_get_out(ptr))
+  def length: Int = guard(lib.mlt_filter_get_length(ptr))
+
+  /** Which track of a [[Tractor]] this was planted on, or 0 if it was simply attached. */
+  def track: Int = guard(lib.mlt_filter_get_track(ptr))
+
+  /** Keep the filter in the graph but stop it doing anything — what an effect's on/off switch sets,
+    * and why it is not the same as detaching. */
+  def disabled: Boolean            = getInt("disable") != 0
+  def disabled_=(v: Boolean): Unit = setInt("disable", if v then 1 else 0)
+
+  override protected def destroy(): Unit = lib.mlt_filter_close(ptr)
+
+object Filter:
+  /** Construct a filter from a named module — "greyscale", "brightness", and whatever else is
+    * installed ([[Mlt.filters]] lists them). `arg` is module-specific. Throws if there is no such
+    * module. */
+  def apply(profile: Profile, service: String, arg: Option[String] = scala.None): Filter = Zone {
+    val a = arg.map(toCString(_)).getOrElse(null)
+    val f = lib.mlt_factory_filter(profile.ptr, toCString(service), a)
+
+    if f == null then throw new MltException(s"mlt: no filter '$service'")
+    new Filter(f)
+  }
+
+/** A service that combines the frames of *two* producers — a wipe, a dissolve, an overlay.
+  *
+  * A transition reaches a graph one of two ways: [[Playlist.mix]] overlaps two clips on one track
+  * with it, or [[Tractor.plantTransition]] runs it between two tracks. Either way it needs to know
+  * over which frames it runs ([[setInAndOut]]) — a transition with no span does nothing. */
+class Transition private[mlt] (ptr: lib.mlt_transition) extends Service(ptr):
+
+  /** The frames over which the transition runs. */
+  def setInAndOut(in: Int, out: Int): Unit = guard(lib.mlt_transition_set_in_and_out(ptr, in, out))
+
+  /** Which two tracks this combines. `a` is the track underneath, `b` the one on top — the one
+    * being transitioned *to*. [[Tractor.plantTransition]] sets these for you. */
+  def setTracks(a: Int, b: Int): Unit = guard(lib.mlt_transition_set_tracks(ptr, a, b))
+
+  def aTrack: Int = guard(lib.mlt_transition_get_a_track(ptr))
+  def bTrack: Int = guard(lib.mlt_transition_get_b_track(ptr))
+  def in: Int     = guard(lib.mlt_transition_get_in(ptr))
+  def out: Int    = guard(lib.mlt_transition_get_out(ptr))
+  def length: Int = guard(lib.mlt_transition_get_length(ptr))
+
+  /** Ignore [[in]]/[[out]] and run over every frame. This is what an overlay wants — compositing a
+    * track onto another is not an event with a duration, it is simply how the two relate. */
+  def alwaysActive: Boolean            = getInt("always_active") != 0
+  def alwaysActive_=(v: Boolean): Unit = setInt("always_active", if v then 1 else 0)
+
+  def disabled: Boolean            = getInt("disable") != 0
+  def disabled_=(v: Boolean): Unit = setInt("disable", if v then 1 else 0)
+
+  override protected def destroy(): Unit = lib.mlt_transition_close(ptr)
+
+object Transition:
+  /** Construct a transition from a named module — "luma" to wipe, "mix" for audio, "frei0r.cairoblend"
+    * or "composite" to overlay ([[Mlt.transitions]] lists them). Throws if there is no such module. */
+  def apply(profile: Profile, service: String, arg: Option[String] = scala.None): Transition = Zone {
+    val a = arg.map(toCString(_)).getOrElse(null)
+    val t = lib.mlt_factory_transition(profile.ptr, toCString(service), a)
+
+    if t == null then throw new MltException(s"mlt: no transition '$service'")
+    new Transition(t)
+  }
+
+/** Parallel tracks combined into one picture — the multitrack timeline, and a producer like any
+  * other, so it renders through the same consumers as a bare clip. Give each track a [[Playlist]]
+  * and this is an editor's timeline.
+  *
+  * A tractor does nothing to combine its tracks by itself. **With no transitions planted, what comes
+  * out is the frame of the highest-numbered track**, and the tracks below it may as well not be
+  * there: nothing has said how they relate. Combining them is a transition ([[plantTransition]]),
+  * and per-track effects are filters ([[plantFilter]]); MLT calls the place both are planted the
+  * tractor's *field*.
+  *
+  * A transition delivers its result onto its `b` track, so a tractor's output is whatever ends up on
+  * the top track. That is what makes the usual arrangement work: tracks numbered from 0 at the
+  * bottom, each composited onto the one below with a transition whose `a` is the lower track and
+  * whose `b` is the upper. */
+class Tractor private[mlt] (ptr: lib.mlt_tractor) extends Producer(ptr):
+
+  /** Put `producer` on track `index`, replacing whatever was there. */
+  def setTrack(producer: Producer, index: Int): Unit =
+    guard(if lib.mlt_tractor_set_track(ptr, producer.ptr, index) != 0 then fail("mlt_tractor_set_track"))
+
+  /** Put `producer` on track `index`, shifting the tracks above it up. */
+  def insertTrack(producer: Producer, index: Int): Unit =
+    guard(if lib.mlt_tractor_insert_track(ptr, producer.ptr, index) != 0 then fail("mlt_tractor_insert_track"))
+
+  def removeTrack(index: Int): Unit =
+    guard(if lib.mlt_tractor_remove_track(ptr, index) != 0 then fail("mlt_tractor_remove_track"))
+
+  /** The producer on track `index`, as a wrapper of its own that must be closed. */
+  def track(index: Int): Producer = guard {
+    val p = lib.mlt_tractor_get_track(ptr, index)
+
+    if p == null then throw new MltException(s"mlt: no track at index $index")
+    borrowed(p)(new Producer(_))
+  }
+
+  def trackCount: Int = guard(lib.mlt_multitrack_count(lib.mlt_tractor_multitrack(ptr)))
+
+  /** Apply `filter` to track `index` as it is combined. Unlike attaching a filter to the track's own
+    * producer, this belongs to the tractor, and survives the track being replaced. */
+  def plantFilter(filter: Filter, index: Int): Unit =
+    guard(if lib.mlt_field_plant_filter(lib.mlt_tractor_field(ptr), filter.ptr, index) != 0 then fail("plant_filter"))
+
+  /** Combine track `a` (underneath) with track `b` (on top) through `transition`. This is how a
+    * tractor comes to show more than one track — and the result lands on track `b`, which is why the
+    * top track is the one that comes out.
+    *
+    * Set the transition's [[Transition.setInAndOut]] span first, or [[Transition.alwaysActive]] for
+    * an overlay that has no duration to speak of. What picture the combination actually makes is the
+    * transition module's own business: "composite" insets `b` into `a` at the rectangle its
+    * `geometry` names, and each module has properties of its own that [[Mlt.metadata]] reports. */
+  def plantTransition(transition: Transition, a: Int, b: Int): Unit =
+    guard(
+      if lib.mlt_field_plant_transition(lib.mlt_tractor_field(ptr), transition.ptr, a, b) != 0 then
+        fail("plant_transition"),
+    )
+
+  /** Recompute the tractor's length from its tracks — a tractor is as long as its longest one. Call
+    * after changing what is on a track, or the length is the one from before. */
+  def refresh(): Unit = guard(lib.mlt_tractor_refresh(ptr))
+
+  override protected def destroy(): Unit = lib.mlt_tractor_close(ptr)
+
+object Tractor:
+  /** An empty tractor rendering against `profile`.
+    *
+    * MLT's own constructor takes no profile — alone among the ones here — so the profile is set on
+    * the tractor's service afterwards. */
+  def apply(profile: Profile): Tractor =
+    val t = lib.mlt_tractor_new()
+
+    if t == null then throw new MltException("mlt: mlt_tractor_new failed")
+    lib.mlt_service_set_profile(t, profile.ptr)
+    new Tractor(t)
 
 /** The far end of a graph: what pulls frames out of it. Consumers come in two shapes, and which one
   * you have decides the whole shape of your loop.
@@ -451,8 +805,61 @@ def rgbaToArgb32(buffer: Ptr[Byte], count: Int): Unit =
     words(i) = ((v & 0xff00ff00) | ((v & 0x000000ff) << 16) | ((v >>> 16) & 0x000000ff)).toUInt
     i += 1
 
+/** Which kind of service a name refers to. The same name can mean different things to different
+  * kinds — "mix" is both a filter and a transition — so looking anything up in the repository takes
+  * both. */
+enum ServiceKind(private[mlt] val value: Int):
+  case Producer   extends ServiceKind(2)
+  case Filter     extends ServiceKind(6)
+  case Transition extends ServiceKind(7)
+  case Consumer   extends ServiceKind(8)
+
+/** What a module says about itself, for presenting it in a browser rather than requiring the user to
+  * already know the name. Modules are not obliged to supply any of this, and many older ones do
+  * not — hence [[Mlt.metadata]] returning an option and both fields being ones too. */
+final case class ServiceMetadata(name: String, title: Option[String], description: Option[String])
+
 /** Framework lifecycle and version. [[init]] must run before any other MLT call. */
 object Mlt:
+
+  /** The names of every installed producer module — "avformat", "color", "qtext", and so on. */
+  def producers: Seq[String] = names(lib.mlt_repository_producers(repository))
+
+  /** The names of every installed filter module. This plus [[metadata]] is an effects browser. */
+  def filters: Seq[String] = names(lib.mlt_repository_filters(repository))
+
+  /** The names of every installed transition module. */
+  def transitions: Seq[String] = names(lib.mlt_repository_transitions(repository))
+
+  /** The names of every installed consumer module — the available outputs. */
+  def consumers: Seq[String] = names(lib.mlt_repository_consumers(repository))
+
+  /** What `service` says about itself, or `None` if the module supplies no metadata — which is
+    * common enough that a browser must have something to fall back on. */
+  def metadata(kind: ServiceKind, service: String): Option[ServiceMetadata] = Zone {
+    val m = lib.mlt_repository_metadata(repository, kind.value, toCString(service))
+
+    if m == null then scala.None
+    else
+      def str(name: String): Option[String] =
+        val s = lib.mlt_properties_get(m, toCString(name))
+
+        if s == null then scala.None else Some(fromCString(s))
+
+      Some(ServiceMetadata(service, str("title"), str("description")))
+  }
+
+  /** The repository is created by [[init]] and closed by [[close]] — borrowed here, never released. */
+  private def repository: lib.mlt_repository =
+    val r = lib.mlt_factory_repository()
+
+    if r == null then throw new MltException("mlt: no repository — Mlt.init() has not been called")
+    r
+
+  /** MLT returns a list of services as a property bag whose *names* are the service names. */
+  private def names(props: lib.mlt_properties): Seq[String] =
+    if props == null then Seq.empty
+    else (0 until lib.mlt_properties_count(props)).map(i => fromCString(lib.mlt_properties_get_name(props, i)))
   /** MLT's version as a display string, e.g. "7.40.0". Safe to call before [[init]]. */
   def version: String = fromCString(lib.mlt_version_get_string())
 

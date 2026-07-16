@@ -17,6 +17,10 @@ import java.io.FileOutputStream
   mediaFile(profile)
   playback(profile)
   exportFile(profile)
+  timeline(profile)
+  effects(profile)
+  multitrack(profile)
+  modules()
   swizzle()
 
   profile.close()
@@ -127,6 +131,180 @@ def exportFile(profile: Profile): Unit =
   consumer.stop()
   consumer.close()
   producer.close()
+
+// A playlist is one track of a timeline: cuts laid end to end, with gaps. It is also a producer, so
+// what this builds could be handed straight to the consumer loop above.
+def timeline(profile: Profile): Unit =
+  val source   = Producer(profile, "demo.mp4")
+  val playlist = Playlist(profile)
+
+  // Two cuts of the same file with a gap between them. The cuts do not disturb the source's own
+  // in/out, which is what lets one open file appear on a track any number of times.
+  playlist.append(source, 0, 29)
+  playlist.blank(10)
+  playlist.append(source, 45, 59)
+
+  println(s"\ntimeline: ${playlist.count} entries, ${playlist.length} frames")
+
+  for c <- playlist.clips do
+    val what = if c.blank then "(blank)" else s"${c.resource.getOrElse("?")} ${c.in}..${c.out}"
+
+    println(f"  [${c.index}] start ${c.start}%3d  len ${c.length}%3d  $what")
+
+  // The razor: cut the first clip in two, and the entry count grows without the length changing.
+  val before = playlist.length
+
+  playlist.split(0, 10)
+
+  println(s"  split clip 0 at 10 -> ${playlist.count} entries, ${playlist.length} frames (was $before)")
+
+  // Ripple delete: take frames out and everything after moves earlier.
+  playlist.removeRegion(0, 5)
+
+  println(s"  removed 5 frames at 0 -> ${playlist.length} frames")
+  println(s"  frame 35 is in entry ${playlist.clipIndexAt(35)}, blank there: ${playlist.isBlankAt(35)}")
+
+  // It renders like anything else — the point of a playlist being a producer.
+  val frame = playlist.frame()
+  val img   = frame.image(ImageFormat.Rgba)
+
+  println(s"  renders: ${img.width}x${img.height}")
+
+  frame.close()
+  playlist.close()
+  source.close()
+
+// A filter modifies one producer's frames. Rendering through one and reading the pixels back is the
+// only way to know it actually ran.
+def effects(profile: Profile): Unit =
+  // "color:red" rather than the "color" service by name: greyscale renders in yuv422, and only a
+  // producer built through the loader carries the filters that convert the frame back to what we ask
+  // for. Name the service and this reads back as yuv422 instead.
+  val producer = Producer(profile, "color:red")
+  val filter   = Filter(profile, "greyscale")
+
+  val before = pixel(producer.frame().image(ImageFormat.Rgba), 10, 10)
+
+  producer.attach(filter)
+
+  val after = pixel(producer.frame().image(ImageFormat.Rgba), 10, 10)
+
+  println(s"\neffects: red pixel ${before.mkString(",")} -> greyscale ${after.mkString(",")}")
+  println(s"  attached: ${producer.filterCount}, grey (R==G==B): ${after(0) == after(1) && after(1) == after(2)}")
+
+  // Disabling leaves it in the graph but stops it working — an effect's on/off switch, which is not
+  // the same edit as removing it.
+  filter.disabled = true
+
+  val off = pixel(producer.frame().image(ImageFormat.Rgba), 10, 10)
+
+  println(s"  disabled -> ${off.mkString(",")}, still attached: ${producer.filterCount}")
+
+  producer.detach(filter)
+
+  println(s"  detached -> ${producer.filterCount}")
+
+  filter.close()
+  producer.close()
+
+// The multitrack timeline: parallel tracks, and the transitions that combine them into one picture.
+def multitrack(profile: Profile): Unit =
+  println("\nmultitrack: a red track and a green one, 5 frames, read at two corners")
+
+  // Each case gets a graph of its own. A producer played to its end stays there, and seeking a
+  // tractor does not rewind the producers on its tracks — so reusing one would compare a fresh graph
+  // against a spent one.
+  def build(label: String)(plant: (Tractor, Profile) => Option[Transition]): Unit =
+    val bottom  = Producer(profile, "color:red")
+    val top     = Producer(profile, "color:green")
+    val tractor = Tractor(profile)
+
+    bottom.setInAndOut(0, 4)
+    top.setInAndOut(0, 4)
+
+    tractor.setTrack(bottom, 0)
+    tractor.setTrack(top, 1)
+    tractor.refresh()
+
+    val transition = plant(tractor, profile)
+
+    println(f"  $label%-34s ${sweep(profile, tractor)}")
+
+    transition.foreach(_.close())
+    tractor.close()
+    top.close()
+    bottom.close()
+
+  // Nothing says how to combine the tracks, so nothing is combined: what comes out is the top track,
+  // and the red one underneath may as well not be there.
+  build("no transition:")((_, _) => scala.None)
+
+  // Composite insets the B track into the A track, at the rectangle its geometry names — the green
+  // track covering the top-left quadrant of the red one.
+  build("composite, inset top-left:") { (tractor, profile) =>
+    Some(composite(profile, tractor, "0/0:50%x50%:100"))
+  }
+
+  // Two keyframes make that rectangle a path, and the inset travels it as the frames advance: it
+  // starts in the top-left corner, crosses the middle where neither corner sees it, and lands in the
+  // bottom-right.
+  build("composite, inset moving:") { (tractor, profile) =>
+    Some(composite(profile, tractor, "0=0/0:50%x50%:100; 4=50%/50%:50%x50%:100"))
+  }
+
+def composite(profile: Profile, tractor: Tractor, geometry: String): Transition =
+  val t = Transition(profile, "composite")
+
+  t.setInAndOut(0, 4)
+  t.set("geometry", geometry)
+  tractor.plantTransition(t, 0, 1)
+  t
+
+// Pull a producer through and report what two opposite corners show on each frame. A tractor's
+// position has to advance through the graph for its transitions to know where they are, so this is
+// not the same as seeking and rendering frames by hand.
+def sweep(profile: Profile, producer: Producer): String =
+  val consumer = Consumer.bare(profile)
+
+  producer.seek(0)
+  consumer.connect(producer)
+  consumer.start()
+
+  var out     = List.empty[String]
+  var running = true
+
+  while running do
+    val frame = consumer.rtFrame().get
+    val img   = frame.image(ImageFormat.Rgba)
+
+    running = frame.speed != 0
+
+    if running then out = s"${colour(pixel(img, 40, 40))}/${colour(pixel(img, 1240, 680))}" :: out
+
+    frame.close()
+
+  consumer.stop()
+  consumer.close()
+  out.reverse.mkString("  ")
+
+// The two tracks are pure colours, so naming them says more than the numbers do — and anything that
+// is neither is worth seeing as numbers.
+def colour(px: Seq[Int]): String =
+  if px(0) > 200 && px(1) < 60 then "red"
+  else if px(1) > 200 && px(0) < 60 then "green"
+  else px.take(3).mkString(",")
+
+// What is installed, and what it says about itself — the backing for an effects browser, which
+// otherwise requires the user to already know the module names.
+def modules(): Unit =
+  println(s"\nmodules: ${Mlt.producers.length} producers, ${Mlt.filters.length} filters, " +
+    s"${Mlt.transitions.length} transitions, ${Mlt.consumers.length} consumers")
+
+  val described = Mlt.filters.flatMap(f => Mlt.metadata(ServiceKind.Filter, f))
+
+  println(s"  ${described.length} of ${Mlt.filters.length} filters describe themselves:")
+
+  for m <- described.take(3) do println(s"    ${m.name}: ${m.title.getOrElse("-")} — ${m.description.getOrElse("-")}")
 
 // The swizzle is what every frame must pass through to reach a Cairo surface, so prove the channel
 // exchange lands where Cairo expects it.

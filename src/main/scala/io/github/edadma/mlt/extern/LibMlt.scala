@@ -31,7 +31,27 @@ object LibMlt:
   type mlt_frame      = Ptr[Byte]
   type mlt_consumer   = Ptr[Byte]
   type mlt_filter     = Ptr[Byte]
+  type mlt_transition = Ptr[Byte]
+  type mlt_playlist   = Ptr[Byte]
+  type mlt_tractor    = Ptr[Byte]
+  type mlt_multitrack = Ptr[Byte]
   type mlt_repository = Ptr[Byte]
+
+  /** A field is not in the hierarchy above: it is the tractor's registry of planted filters and
+    * transitions, owned by the tractor and closed with it. */
+  type mlt_field = Ptr[Byte]
+
+  /** `mlt_whence` — what a relative position is measured from. */
+  final val mlt_whence_relative_start   = 0
+  final val mlt_whence_relative_current = 1
+  final val mlt_whence_relative_end     = 2
+
+  /** `mlt_service_type` — the subclass a service reports itself as, and the key the repository
+    * indexes its metadata by. */
+  final val mlt_service_producer_type   = 2
+  final val mlt_service_filter_type     = 6
+  final val mlt_service_transition_type = 7
+  final val mlt_service_consumer_type   = 8
 
   /** A frame count. MLT's `mlt_position` is `int32_t` unless libmlt was built with
     * `DOUBLE_MLT_POSITION`, which redefines it to `double` — an ABI difference that would silently
@@ -47,6 +67,28 @@ object LibMlt:
     * sample_aspect_den, display_aspect_num, display_aspect_den, colorspace, is_explicit` */
   type mlt_profile_s = CStruct12[CString, CInt, CInt, CInt, CInt, CInt, CInt, CInt, CInt, CInt, CInt, CInt]
   type mlt_profile   = Ptr[mlt_profile_s]
+
+  /** `mlt_playlist_clip_info` — everything a playlist knows about one entry, filled in by
+    * [[mlt_playlist_get_clip_info]]. This is the shape a timeline draws from: where the clip sits on
+    * the playlist, which part of the source it shows, and where that source came from.
+    *
+    * `clip, producer, cut, start, resource, frame_in, frame_out, frame_count, length, fps, repeat`
+    *
+    * The `producer`/`cut` pointers and the `resource` string are borrowed from the playlist entry and
+    * are invalidated by any edit to it. */
+  type mlt_playlist_clip_info = CStruct11[
+    CInt,        // clip — index within the playlist
+    mlt_producer, // producer — the clip's producer (or a cut's parent)
+    mlt_producer, // cut
+    mlt_position, // start — where this begins on the playlist
+    CString,     // resource
+    mlt_position, // frame_in
+    mlt_position, // frame_out
+    mlt_position, // frame_count — the clip's duration as edited
+    mlt_position, // length — the source's unedited duration
+    CFloat,      // fps
+    CInt,        // repeat
+  ]
 
   // -- Factory ---------------------------------------------------------------------------------
 
@@ -87,6 +129,12 @@ object LibMlt:
   def mlt_properties_set_double(self: mlt_properties, name: CString, value: CDouble): CInt  = extern
   def mlt_properties_get_double(self: mlt_properties, name: CString): CDouble               = extern
 
+  // A property bag doubles as MLT's list type — the repository returns the available services as one,
+  // keyed by service name. These three walk it by position.
+  def mlt_properties_count(self: mlt_properties): CInt                 = extern
+  def mlt_properties_get_name(self: mlt_properties, index: CInt): CString  = extern
+  def mlt_properties_get_value(self: mlt_properties, index: CInt): CString = extern
+
   // Reference counting. Every MLT type in the properties hierarchy is refcounted through these;
   // the Scala facade holds exactly one reference per live wrapper.
   def mlt_properties_inc_ref(self: mlt_properties): CInt   = extern
@@ -122,6 +170,29 @@ object LibMlt:
 
   /** The profile a service renders against. */
   def mlt_service_profile(self: mlt_service): mlt_profile = extern
+
+  /** Tell a service which profile to render against. Needed by the types MLT constructs without one
+    * — `mlt_tractor_new` takes no profile, so its service must be told afterwards. */
+  def mlt_service_set_profile(self: mlt_service, profile: mlt_profile): Unit = extern
+
+  /** Attach a filter, so that every frame this service produces passes through it. A service may
+    * have any number, applied in order. Returns 0 on success. */
+  def mlt_service_attach(self: mlt_service, filter: mlt_filter): CInt = extern
+
+  /** Remove a previously attached filter. Returns 0 on success. */
+  def mlt_service_detach(self: mlt_service, filter: mlt_filter): CInt = extern
+
+  def mlt_service_filter_count(self: mlt_service): CInt = extern
+
+  /** The attached filter at `index`. The pointer is borrowed — owned by the service, not the
+    * caller. */
+  def mlt_service_filter(self: mlt_service, index: CInt): mlt_filter = extern
+
+  /** Reorder the attached filters, which reorders how they are applied. Returns 0 on success. */
+  def mlt_service_move_filter(self: mlt_service, from: CInt, to: CInt): CInt = extern
+
+  /** What subclass a service actually is — one of the `mlt_service_*_type` values. */
+  def mlt_service_identify(self: mlt_service): CInt = extern
 
   // -- Producer --------------------------------------------------------------------------------
 
@@ -187,6 +258,198 @@ object LibMlt:
 
   /** Release a consumer, stopping it first if it is still running. */
   def mlt_consumer_close(self: mlt_consumer): Unit = extern
+
+  // -- Playlist --------------------------------------------------------------------------------
+  //
+  // A playlist is a sequence of clips and blanks that is itself a producer — which is what makes a
+  // timeline track composable: it plays as one continuous piece of video.
+
+  /** Construct an empty playlist rendering against `profile`. */
+  def mlt_playlist_new(profile: mlt_profile): mlt_playlist = extern
+
+  /** Append a producer's whole in..out region as the next clip. Returns 0 on success. */
+  def mlt_playlist_append(self: mlt_playlist, producer: mlt_producer): CInt = extern
+
+  /** Append only `in..out` of a producer — the trimmed cut, without disturbing the producer's own
+    * in/out points, so one producer can appear as several different cuts. Returns 0 on success. */
+  def mlt_playlist_append_io(
+      self: mlt_playlist,
+      producer: mlt_producer,
+      in: mlt_position,
+      out: mlt_position,
+  ): CInt = extern
+
+  /** Append `out + 1` frames of nothing — how a gap between clips is expressed. */
+  def mlt_playlist_blank(self: mlt_playlist, out: mlt_position): CInt = extern
+
+  /** The number of entries, counting blanks. */
+  def mlt_playlist_count(self: mlt_playlist): CInt = extern
+
+  def mlt_playlist_clear(self: mlt_playlist): CInt = extern
+
+  /** Insert `producer`'s `in..out` before entry `where`, shifting the rest later. */
+  def mlt_playlist_insert(
+      self: mlt_playlist,
+      producer: mlt_producer,
+      where: CInt,
+      in: mlt_position,
+      out: mlt_position,
+  ): CInt = extern
+
+  /** Remove entry `where`, closing the gap. Returns 0 on success. */
+  def mlt_playlist_remove(self: mlt_playlist, where: CInt): CInt = extern
+
+  /** Move an entry, shifting whatever lies between. Returns 0 on success. */
+  def mlt_playlist_move(self: mlt_playlist, from: CInt, to: CInt): CInt = extern
+
+  /** Retrim entry `clip` to a new in..out — the edit a timeline drag performs. */
+  def mlt_playlist_resize_clip(self: mlt_playlist, clip: CInt, in: mlt_position, out: mlt_position): CInt = extern
+
+  /** Cut entry `clip` in two at `position`, measured from the clip's own start. */
+  def mlt_playlist_split(self: mlt_playlist, clip: CInt, position: mlt_position): CInt = extern
+
+  /** Cut whatever entry lies under `position` (measured on the playlist), keeping the left part as
+    * the earlier entry when `left` is non-zero. */
+  def mlt_playlist_split_at(self: mlt_playlist, position: mlt_position, left: CInt): CInt = extern
+
+  /** Rejoin `count` entries starting at `clip` back into one. */
+  def mlt_playlist_join(self: mlt_playlist, clip: CInt, count: CInt, merge: CInt): CInt = extern
+
+  /** Overlap the end of `clip` with the start of the next by `length` frames, rendering the overlap
+    * through `transition` — a cross-fade. Pass null to mix without one. */
+  def mlt_playlist_mix(self: mlt_playlist, clip: CInt, length: CInt, transition: mlt_transition): CInt = extern
+
+  /** Fill `info` in for entry `index`. Returns 0 on success. */
+  def mlt_playlist_get_clip_info(self: mlt_playlist, info: Ptr[mlt_playlist_clip_info], index: CInt): CInt = extern
+
+  /** The producer of entry `clip`. Borrowed — owned by the playlist. */
+  def mlt_playlist_get_clip(self: mlt_playlist, clip: CInt): mlt_producer = extern
+
+  /** The producer playing at `position` on the playlist. Borrowed. */
+  def mlt_playlist_get_clip_at(self: mlt_playlist, position: mlt_position): mlt_producer = extern
+
+  /** The index of the entry at `position` on the playlist. */
+  def mlt_playlist_get_clip_index_at(self: mlt_playlist, position: mlt_position): CInt = extern
+
+  /** Where entry `clip` begins, as a frame number on the playlist. */
+  def mlt_playlist_clip_start(self: mlt_playlist, clip: CInt): CInt = extern
+
+  /** How many frames entry `clip` occupies. */
+  def mlt_playlist_clip_length(self: mlt_playlist, clip: CInt): CInt = extern
+
+  /** Whether entry `clip` is a blank rather than a clip. */
+  def mlt_playlist_is_blank(self: mlt_playlist, clip: CInt): CInt = extern
+
+  def mlt_playlist_is_blank_at(self: mlt_playlist, position: mlt_position): CInt = extern
+
+  /** Fold runs of adjacent blanks into one, optionally preserving the playlist's total length. */
+  def mlt_playlist_consolidate_blanks(self: mlt_playlist, keep_length: CInt): Unit = extern
+
+  /** Cut `length` frames out of the playlist at `position`, closing the gap. */
+  def mlt_playlist_remove_region(self: mlt_playlist, position: mlt_position, length: CInt): CInt = extern
+
+  /** Release a playlist. As with every type here, this is the destructor to use — it performs the
+    * playlist's own teardown before giving back its reference. */
+  def mlt_playlist_close(self: mlt_playlist): Unit = extern
+
+  // -- Filter ----------------------------------------------------------------------------------
+
+  /** Construct a filter from a named module ("greyscale", "brightness", ...). `arg` is
+    * module-specific and may be null. Returns null if no module can handle it. */
+  def mlt_factory_filter(profile: mlt_profile, service: CString, arg: CString): mlt_filter = extern
+
+  /** Limit a filter to the frames `in..out` of whatever it is attached to. A filter with no in/out
+    * set applies throughout. */
+  def mlt_filter_set_in_and_out(self: mlt_filter, in: mlt_position, out: mlt_position): Unit = extern
+
+  def mlt_filter_get_in(self: mlt_filter): mlt_position     = extern
+  def mlt_filter_get_out(self: mlt_filter): mlt_position    = extern
+  def mlt_filter_get_length(self: mlt_filter): mlt_position = extern
+
+  /** Which track of a multitrack this filter was planted on. */
+  def mlt_filter_get_track(self: mlt_filter): CInt = extern
+
+  def mlt_filter_close(self: mlt_filter): Unit = extern
+
+  // -- Transition ------------------------------------------------------------------------------
+
+  /** Construct a transition from a named module ("luma" to wipe, "mix" for audio, "composite" or
+    * "frei0r.cairoblend" to overlay). Returns null if no module can handle it. */
+  def mlt_factory_transition(profile: mlt_profile, service: CString, arg: CString): mlt_transition = extern
+
+  /** The frames over which the transition runs. */
+  def mlt_transition_set_in_and_out(self: mlt_transition, in: mlt_position, out: mlt_position): Unit = extern
+
+  /** Which two tracks of a multitrack the transition combines — `a_track` is the one underneath. */
+  def mlt_transition_set_tracks(self: mlt_transition, a_track: CInt, b_track: CInt): Unit = extern
+
+  def mlt_transition_get_a_track(self: mlt_transition): CInt      = extern
+  def mlt_transition_get_b_track(self: mlt_transition): CInt      = extern
+  def mlt_transition_get_in(self: mlt_transition): mlt_position   = extern
+  def mlt_transition_get_out(self: mlt_transition): mlt_position  = extern
+  def mlt_transition_get_length(self: mlt_transition): mlt_position = extern
+
+  def mlt_transition_close(self: mlt_transition): Unit = extern
+
+  // -- Tractor, multitrack, field --------------------------------------------------------------
+  //
+  // The tractor is the multitrack timeline: it holds parallel tracks (a multitrack) and the filters
+  // and transitions that combine them (a field), and is itself a producer.
+
+  /** Construct an empty tractor. Note it takes no profile — unlike every other constructor here —
+    * so the caller must set one on its service afterwards with [[mlt_service_set_profile]]. */
+  def mlt_tractor_new(): mlt_tractor = extern
+
+  /** Put `producer` on track `index`, replacing whatever was there. Returns 0 on success. */
+  def mlt_tractor_set_track(self: mlt_tractor, producer: mlt_producer, index: CInt): CInt = extern
+
+  /** Put `producer` on track `index`, shifting the tracks above it up. Returns 0 on success. */
+  def mlt_tractor_insert_track(self: mlt_tractor, producer: mlt_producer, index: CInt): CInt = extern
+
+  def mlt_tractor_remove_track(self: mlt_tractor, index: CInt): CInt = extern
+
+  /** The producer on track `index`. Borrowed — owned by the tractor's multitrack. */
+  def mlt_tractor_get_track(self: mlt_tractor, index: CInt): mlt_producer = extern
+
+  /** The tractor's multitrack. Borrowed; the tractor closes it. */
+  def mlt_tractor_multitrack(self: mlt_tractor): mlt_multitrack = extern
+
+  /** The tractor's field — where its filters and transitions are planted. Borrowed; the tractor
+    * closes it. */
+  def mlt_tractor_field(self: mlt_tractor): mlt_field = extern
+
+  /** Recompute the tractor's length from its tracks. Needed after changing what is on one. */
+  def mlt_tractor_refresh(self: mlt_tractor): Unit = extern
+
+  def mlt_tractor_close(self: mlt_tractor): Unit = extern
+
+  /** How many tracks a multitrack holds. */
+  def mlt_multitrack_count(self: mlt_multitrack): CInt = extern
+
+  /** Plant a filter on `track` of the field's multitrack, so it applies to that track's frames as
+    * they are combined. Returns 0 on success. */
+  def mlt_field_plant_filter(self: mlt_field, that: mlt_filter, track: CInt): CInt = extern
+
+  /** Plant a transition combining `a_track` (underneath) with `b_track` (on top). Returns 0 on
+    * success. */
+  def mlt_field_plant_transition(self: mlt_field, that: mlt_transition, a_track: CInt, b_track: CInt): CInt = extern
+
+  // -- Repository ------------------------------------------------------------------------------
+  //
+  // What modules are installed, and what they claim to do — the backing for an effects browser.
+
+  /** The repository loaded by [[mlt_factory_init]]. Borrowed; the factory closes it. */
+  def mlt_factory_repository(): mlt_repository = extern
+
+  // Each returns a property bag whose *names* are the available service names.
+  def mlt_repository_producers(self: mlt_repository): mlt_properties   = extern
+  def mlt_repository_filters(self: mlt_repository): mlt_properties     = extern
+  def mlt_repository_transitions(self: mlt_repository): mlt_properties = extern
+  def mlt_repository_consumers(self: mlt_repository): mlt_properties   = extern
+
+  /** A service's self-description — title, description, parameters and their ranges. `type` is one
+    * of the `mlt_service_*_type` values. Returns null if the module supplies no metadata. */
+  def mlt_repository_metadata(self: mlt_repository, `type`: CInt, service: CString): mlt_properties = extern
 
   // -- Frame -----------------------------------------------------------------------------------
 

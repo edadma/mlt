@@ -3,10 +3,11 @@
 Scala Native bindings for [MLT](https://www.mltframework.org/) — the multitrack audio/video
 authoring framework that powers Shotcut, Kdenlive, and Flowblade.
 
-> **Status:** early, but it plays and encodes real video. The framework lifecycle, profiles, the
-> property bag, producers (including `avformat` media files), frame rendering, and consumers all
-> work — `sbt run` decodes a clip frame by frame and transcodes it to H.264. Playlists, filters, and
-> transitions are next.
+> **Status:** early, but it edits, plays, and encodes real video. The framework lifecycle, profiles,
+> the property bag, producers (including `avformat` media files), frame rendering, consumers,
+> playlists, filters, transitions, and multitrack tractors all work — `sbt run` assembles a timeline,
+> composites two tracks, decodes a clip frame by frame, and transcodes it to H.264. Reading and
+> writing MLT XML is next.
 
 ## Requirements
 
@@ -67,8 +68,41 @@ while running do
   frame.close()
 ```
 
-`sbt run` renders a frame of the bundled `demo.mp4` as a PPM, plays the clip through to the end, and
-transcodes it to `mlt-export.mp4`.
+A timeline is a `Playlist` — a sequence of cuts and gaps that is itself a producer, so it plays and
+exports exactly like the clip above:
+
+```scala
+val playlist = Playlist(profile)
+
+playlist.append(source, 0, 29)  // frames 0..29 of the source
+playlist.blank(10)              // a ten-frame gap
+playlist.append(source, 45, 59) // and a second cut of the same source
+
+playlist.split(0, 10)           // razor the first clip in two
+playlist.removeRegion(0, 5)     // ripple delete five frames
+
+for c <- playlist.clips do println(s"${c.start}..${c.start + c.length}: ${c.resource}")
+```
+
+Put a playlist on each track of a `Tractor` and combine them with a `Transition`:
+
+```scala
+val tractor = Tractor(profile)
+
+tractor.setTrack(background, 0)
+tractor.setTrack(overlay, 1)
+tractor.refresh()
+
+val pip = Transition(profile, "composite")
+
+pip.set("geometry", "0/0:50%x50%:100") // inset the upper track, top-left quadrant
+pip.setInAndOut(0, tractor.length - 1)
+tractor.plantTransition(pip, 0, 1)
+```
+
+`sbt run` renders a frame of the bundled `demo.mp4` as a PPM, plays the clip through to the end,
+transcodes it to `mlt-export.mp4`, assembles the timeline above, greyscales a clip, and composites a
+moving inset over a second track.
 
 ## Design
 
@@ -117,6 +151,31 @@ close your wrapper, and the playlist's reference keeps it alive.
 `close()` is idempotent, and every accessor is guarded, so double-close and use-after-close raise a
 Scala exception with a stack trace instead of segfaulting inside libmlt.
 
+### The loader, and why a producer's construction matters
+
+`Producer(profile, "demo.mp4")` and `Producer(profile, "demo.mp4", Some("avformat"))` look like the
+same thing said two ways, and for a while they behave like it. They are not.
+
+Naming no service routes construction through MLT's **loader** producer, which does more than pick a
+module by looking at the resource: it wraps that module in MLT's format-conversion filters. Those are
+what make `frame.image(ImageFormat.Rgba)` mean anything. Without them a producer still honours the
+request — every module renders on demand, into whatever format is asked of it — so nothing looks
+wrong until the first filter is attached. A filter renders in whatever format suits it (greyscale
+works in `yuv422`), hands that format back regardless of the request, and with no conversion filters
+in the graph there is nothing left to put it right:
+
+| producer | asked for `rgba`, with a greyscale filter attached |
+|---|---|
+| `Producer(profile, "color:red")` — via loader | `rgba` |
+| `Producer(profile, "red", Some("color"))` | **`yuv422`** |
+| `Producer(profile, "demo.mp4")` — via loader | `rgba` |
+| `Producer(profile, "demo.mp4", Some("avformat"))` | **`yuv422`** |
+
+So: omit the service unless you have a reason not to. Naming one is the escape hatch, and it costs
+the conversion. This is also why `Service.filterCount` reads 10 on a freshly loaded producer that has
+had nothing attached to it — those are the loader's conversion filters, attached filters like any
+other.
+
 ### Two kinds of consumer
 
 A consumer is the far end of a graph, and which kind you have decides the shape of your loop.
@@ -150,6 +209,29 @@ producer's speed at the moment the frame was made and drops to zero once it has 
 MLT advances the producer *after* making each frame, so the first frame reporting `speed == 0` is one
 produced past the end — a duplicate of the last real frame. Stop on it, and discard it rather than
 show it. That yields exactly the clip: 60 frames, positions 0..59, no repeats.
+
+### Tracks, and which one comes out
+
+A `Tractor` holds parallel tracks, numbered from 0 up. It is tempting to read track 0 as "the
+output" and the rest as things layered onto it, but that is backwards, and the difference shows the
+moment a tractor has two tracks and nothing planted on it: **what comes out is the frame of the
+highest-numbered track.** Everything below it may as well not be there. Nothing has said how the
+tracks relate, so nothing combines them.
+
+What says how they relate is a transition, and a transition delivers its result onto its `b` track.
+That is what makes the conventional arrangement work: number tracks from 0 at the bottom, composite
+each onto the one below with a transition whose `a` is the lower and whose `b` is the upper, and the
+result walks up the stack to emerge on top.
+
+```scala
+tractor.plantTransition(pip, 0, 1) // combine track 0 with track 1; result lands on track 1
+```
+
+What picture the combination actually makes is the transition module's own business, and the modules
+vary more than their names suggest — `composite` insets its `b` track into its `a` track at the
+rectangle its `geometry` names, and a geometry with two keyframes makes that rectangle a path the
+inset travels as the frames advance. `Mlt.transitions` lists what is installed and `Mlt.metadata`
+reports what each one says about itself; this binding plants them and does not second-guess them.
 
 ### Pixel formats, and the one unavoidable copy
 
