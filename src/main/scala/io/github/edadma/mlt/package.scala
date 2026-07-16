@@ -1071,7 +1071,7 @@ final case class ImagePlanes(width: Int, height: Int, format: ImageFormat, plane
 final case class Audio(buffer: Ptr[Byte], format: AudioFormat, frequency: Int, channels: Int, samples: Int)
 
 /** An `mlt_audio_format` — how a frame's audio samples are laid out. Treat it as a tag; the value
-  * you usually ask for is [[F32le]] (32-bit interleaved float), which is what an audio device takes.
+  * you usually ask for is `F32le` (32-bit interleaved float), which is what an audio device takes.
   * The interleaved formats pack the channels sample by sample; the non-interleaved ones keep each
   * channel in its own run. */
 opaque type AudioFormat = Int
