@@ -423,6 +423,36 @@ def modules(): Unit =
 
   for m <- described.take(3) do println(s"    ${m.name}: ${m.title.getOrElse("-")} — ${m.description.getOrElse("-")}")
 
+  // A module's parameters are what build its control panel. Read two known ones back and check them
+  // against the shipped YAML: brightness carries float bounds and defaults, mirror an enumerated
+  // string whose allowed values come out of the nested `values:` list.
+  val withParams = described.count(_.parameters.nonEmpty)
+
+  println(s"  $withParams of ${described.length} describing filters expose parameters")
+
+  def dumpParams(name: String): Unit =
+    Mlt.metadata(ServiceKind.Filter, name).foreach { m =>
+      println(s"    $name has ${m.parameters.length} parameters:")
+
+      for p <- m.parameters do
+        val t     = p.paramType.map(_.toString).getOrElse("string?")
+        val range = (p.minimum, p.maximum) match
+          case (Some(lo), Some(hi)) => s" [$lo..$hi]"
+          case (Some(lo), scala.None) => s" [$lo..]"
+          case (scala.None, Some(hi)) => s" [..$hi]"
+          case _                      => ""
+        val dflt = p.default.map(d => s" =$d").getOrElse("")
+        val vals = if p.values.isEmpty then "" else s" {${p.values.mkString(",")}}"
+        val flags = Seq("mutable" -> p.mutable, "anim" -> p.animation, "arg" -> p.argument)
+          .collect { case (n, true) => n }
+          .mkString(",")
+
+        println(s"      ${p.identifier}: $t$range$dflt$vals${if flags.isEmpty then "" else s" ($flags)"}")
+    }
+
+  dumpParams("brightness")
+  dumpParams("mirror")
+
 // The swizzle is what every frame must pass through to reach a Cairo surface, so prove the channel
 // exchange lands where Cairo expects it.
 def swizzle(): Unit =

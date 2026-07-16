@@ -1122,10 +1122,60 @@ enum ServiceKind(private[mlt] val value: Int):
   case Transition extends ServiceKind(7)
   case Consumer   extends ServiceKind(8)
 
+/** The kind of value a parameter takes, from MLT's metadata vocabulary. A control panel maps this to
+  * a widget: a slider for `Integer`/`Float`, a checkbox for `Boolean`, a colour well for `Color`, a
+  * geometry editor for `Rect`, a text field for `Text`. `Other` carries the raw type name for the few
+  * structural kinds a module may declare (`properties`, `seq`, `map`, `time`) that a generic editor
+  * renders as text. A parameter that declares no type has `None` at [[ParameterMetadata.paramType]],
+  * which MLT treats as a string. */
+enum ParameterType:
+  case Integer, Float, Boolean, Text, Color, Rect
+  case Other(raw: String)
+
+object ParameterType:
+  /** MLT's metadata spells string three ways (`string`/`str`/`text`) and folds them to one here. */
+  private[mlt] def fromRaw(s: String): ParameterType = s match
+    case "integer"                 => Integer
+    case "float"                   => Float
+    case "boolean"                 => Boolean
+    case "string" | "str" | "text" => Text
+    case "color"                   => Color
+    case "rect"                    => Rect
+    case other                     => Other(other)
+
+/** One tunable of a module — enough to render a control for it and know which property to set on the
+  * [[Filter]]/[[Transition]]/producer to drive it. `identifier` is that property name. The bounds and
+  * default are the module's own strings, left unparsed because their shape follows [[paramType]] (a
+  * `Rect` default is `"0/0:100%x100%"`, an `Integer` default is `"0"`). `values` is the closed set of
+  * allowed strings for an enumerated parameter, empty when it is free-valued. `mutable` marks a
+  * parameter that can be changed during playback, `animation` one that accepts keyframes. */
+final case class ParameterMetadata(
+    identifier: String,
+    title: Option[String],
+    description: Option[String],
+    paramType: Option[ParameterType],
+    minimum: Option[String],
+    maximum: Option[String],
+    default: Option[String],
+    unit: Option[String],
+    widget: Option[String],
+    values: Seq[String],
+    mutable: Boolean,
+    animation: Boolean,
+    argument: Boolean,
+)
+
 /** What a module says about itself, for presenting it in a browser rather than requiring the user to
   * already know the name. Modules are not obliged to supply any of this, and many older ones do
-  * not — hence [[Mlt.metadata]] returning an option and both fields being ones too. */
-final case class ServiceMetadata(name: String, title: Option[String], description: Option[String])
+  * not — hence [[Mlt.metadata]] returning an option and the title/description being ones too.
+  * `parameters` lists the module's tunables (empty when it declares none), which is what builds an
+  * effect's control panel. */
+final case class ServiceMetadata(
+    name: String,
+    title: Option[String],
+    description: Option[String],
+    parameters: Seq[ParameterMetadata],
+)
 
 /** Framework lifecycle and version. [[init]] must run before any other MLT call. */
 object Mlt:
@@ -1143,19 +1193,75 @@ object Mlt:
   def consumers: Seq[String] = names(lib.mlt_repository_consumers(repository))
 
   /** What `service` says about itself, or `None` if the module supplies no metadata — which is
-    * common enough that a browser must have something to fall back on. */
+    * common enough that a browser must have something to fall back on. The returned
+    * [[ServiceMetadata.parameters]] describe the module's tunables, from which a control panel is
+    * built. */
   def metadata(kind: ServiceKind, service: String): Option[ServiceMetadata] = Zone {
     val m = lib.mlt_repository_metadata(repository, kind.value, toCString(service))
 
     if m == null then scala.None
-    else
-      def str(name: String): Option[String] =
-        val s = lib.mlt_properties_get(m, toCString(name))
-
-        if s == null then scala.None else Some(fromCString(s))
-
-      Some(ServiceMetadata(service, str("title"), str("description")))
+    else Some(ServiceMetadata(service, propStr(m, "title"), propStr(m, "description"), parameters(m)))
   }
+
+  /** Read a string property, `None` when it is unset. */
+  private def propStr(p: lib.mlt_properties, name: String)(using Zone): Option[String] =
+    val s = lib.mlt_properties_get(p, toCString(name))
+
+    if s == null then scala.None else Some(fromCString(s))
+
+  /** MLT's metadata spells a boolean as the YAML scalar `yes`/`no` (some modules use `1`/`0`); absent
+    * reads as false. */
+  private def propBool(p: lib.mlt_properties, name: String)(using Zone): Boolean =
+    lib.mlt_properties_get(p, toCString(name)) match
+      case s if s == null => false
+      case s              => val t = fromCString(s); t == "yes" || t == "1" || t == "true"
+
+  /** Walk a module's `parameters:` sequence. The metadata YAML parser stores it as a child property
+    * bag reached by [[lib.mlt_properties_get_data]], each entry itself a bag reached by position; a
+    * parameter with no `identifier` is not something a UI can bind, so it is dropped. */
+  private def parameters(meta: lib.mlt_properties)(using Zone): Seq[ParameterMetadata] =
+    val len    = stackalloc[CInt]()
+    val params = lib.mlt_properties_get_data(meta, toCString("parameters"), len)
+
+    if params == null then Seq.empty
+    else
+      (0 until lib.mlt_properties_count(params)).flatMap { i =>
+        val p = lib.mlt_properties_get_data_at(params, i, len)
+
+        if p == null then scala.None
+        else
+          propStr(p, "identifier").map { id =>
+            ParameterMetadata(
+              identifier = id,
+              title = propStr(p, "title"),
+              description = propStr(p, "description"),
+              paramType = propStr(p, "type").map(ParameterType.fromRaw),
+              minimum = propStr(p, "minimum"),
+              maximum = propStr(p, "maximum"),
+              default = propStr(p, "default"),
+              unit = propStr(p, "unit"),
+              widget = propStr(p, "widget"),
+              values = enumeratedValues(p),
+              mutable = propBool(p, "mutable"),
+              animation = propBool(p, "animation"),
+              argument = propBool(p, "argument"),
+            )
+          }
+      }
+
+  /** The closed set of allowed strings for an enumerated parameter — its `values:` sequence, whose
+    * scalar entries the parser keeps as ordinary indexed values. Empty when the parameter is free. */
+  private def enumeratedValues(param: lib.mlt_properties)(using Zone): Seq[String] =
+    val len    = stackalloc[CInt]()
+    val values = lib.mlt_properties_get_data(param, toCString("values"), len)
+
+    if values == null then Seq.empty
+    else
+      (0 until lib.mlt_properties_count(values)).flatMap { i =>
+        val v = lib.mlt_properties_get_value(values, i)
+
+        if v == null then scala.None else Some(fromCString(v))
+      }
 
   /** The repository is created by [[init]] and closed by [[close]] — borrowed here, never released. */
   private def repository: lib.mlt_repository =

@@ -135,6 +135,13 @@ object LibMlt:
   def mlt_properties_get_name(self: mlt_properties, index: CInt): CString  = extern
   def mlt_properties_get_value(self: mlt_properties, index: CInt): CString = extern
 
+  // A property may hold an opaque data value rather than a string — the module-metadata YAML parser
+  // stores nested maps and sequences (a module's `parameters:` list, a parameter's `values:` list)
+  // as child `mlt_properties` reached this way. Both return borrowed pointers owned by the parent;
+  // `length` may be null when the size is not wanted.
+  def mlt_properties_get_data(self: mlt_properties, name: CString, length: Ptr[CInt]): Ptr[Byte]  = extern
+  def mlt_properties_get_data_at(self: mlt_properties, index: CInt, size: Ptr[CInt]): Ptr[Byte]   = extern
+
   // Reference counting. Every MLT type in the properties hierarchy is refcounted through these;
   // the Scala facade holds exactly one reference per live wrapper.
   def mlt_properties_inc_ref(self: mlt_properties): CInt   = extern
