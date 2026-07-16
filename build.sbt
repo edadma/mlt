@@ -50,5 +50,9 @@ scalacOptions ++= Seq(
   "-language:existentials",
 )
 
+// scaladoc doesn't support the Scala Native compiler plugin (-Xplugin: nscplugin) that
+// sbt-scala-native adds for compilation; drop it from the doc task so `doc` is warning-free.
+Compile / doc / scalacOptions ~= { _.filterNot(_.startsWith("-Xplugin")) }
+
 publishMavenStyle      := true
 Test / publishArtifact := false

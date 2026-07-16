@@ -964,7 +964,7 @@ object Profile:
   * frame through Cairo therefore costs a channel swap — see [[rgbaToArgb32]].
   *
   * That cost is a reason to avoid drawing video through Cairo at all rather than a reason to pay it:
-  * a graphics API that takes [[Yuv420p]] through [[Frame.imagePlanes]] converts the frame while it
+  * a graphics API that takes [[ImageFormat.Yuv420p]] through [[Frame.imagePlanes]] converts the frame while it
   * draws it, so nothing on the CPU touches the pixels. Keep the packed formats for stills and for
   * pixels being inspected; give moving video to the GPU planar. */
 opaque type ImageFormat = Int
@@ -1030,10 +1030,10 @@ final case class ImagePlanes(width: Int, height: Int, format: ImageFormat, plane
   * and this says which set. Its numbers are mostly the standards' own — 709, 601, 2020 — rather than
   * a dense enumeration, so treat it as a tag and compare against the named values here.
   *
-  * The distinction that matters in practice is HD versus SD: [[Bt709]] is essentially all HD video,
-  * while [[Bt601]], [[Bt470bg]] (625-line PAL), [[Smpte170m]] (525-line NTSC) and [[Smpte240m]] are
-  * the SD family and share its coefficients. Something choosing between two conversions wants to
-  * treat that whole family alike. */
+  * The distinction that matters in practice is HD versus SD: [[Colorspace.Bt709]] is essentially all
+  * HD video, while [[Colorspace.Bt601]], [[Colorspace.Bt470bg]] (625-line PAL), [[Colorspace.Smpte170m]]
+  * (525-line NTSC) and [[Colorspace.Smpte240m]] are the SD family and share its coefficients. Something
+  * choosing between two conversions wants to treat that whole family alike. */
 opaque type Colorspace = Int
 
 object Colorspace:

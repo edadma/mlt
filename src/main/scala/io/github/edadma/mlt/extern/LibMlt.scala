@@ -462,7 +462,7 @@ object LibMlt:
 
   // -- Frame -----------------------------------------------------------------------------------
 
-  /** Render this frame's image. `format` is in/out: pass the desired [[mlt_image_format]] and MLT
+  /** Render this frame's image. `format` is in/out: pass the desired `mlt_image_format` and MLT
     * converts, writing back what it actually produced. `buffer` receives a pointer to pixels owned
     * by the frame — valid until the frame is closed, and not to be freed. `writable` asks for a
     * buffer safe to modify in place. Returns 0 on success. */
