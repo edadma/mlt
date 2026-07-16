@@ -20,6 +20,7 @@ import java.io.FileOutputStream
   timeline(profile)
   effects(profile)
   multitrack(profile)
+  project(profile)
   modules()
   swizzle()
 
@@ -293,6 +294,99 @@ def colour(px: Seq[Int]): String =
   if px(0) > 200 && px(1) < 60 then "red"
   else if px(1) > 200 && px(0) < 60 then "green"
   else px.take(3).mkString(",")
+
+// MLT XML is the project format, so what has to be true of it is that a graph survives the trip out
+// and back. Saving, loading and saving again is the test that says so: whatever the loader drops
+// shows up as a difference between the two files.
+def project(profile: Profile): Unit =
+  val source  = Producer(profile, "demo.mp4")
+  val track   = Playlist(profile)
+  val overlay = Playlist(profile)
+  val red     = Producer(profile, "color:red")
+  val grey    = Filter(profile, "greyscale")
+  val pip     = Transition(profile, "composite")
+  val tractor = Tractor(profile)
+
+  track.append(source, 0, 29)
+  track.blank(10)
+  track.append(source, 45, 59)
+
+  red.setInAndOut(0, 19)
+  overlay.append(red)
+  overlay.attach(grey)
+
+  tractor.setTrack(track, 0)
+  tractor.setTrack(overlay, 1)
+  tractor.refresh()
+
+  pip.setInAndOut(0, 19)
+  pip.set("geometry", "0/0:50%x50%:100")
+  tractor.plantTransition(pip, 0, 1)
+
+  val path = "mlt-project.mlt"
+
+  Xml.save(tractor, path, title = Some("Demo Project"), includeMeta = false)
+
+  println(s"\nproject: wrote $path, ${new java.io.File(path).length} bytes")
+
+  val written = Xml.serialise(tractor, title = Some("Demo Project"), includeMeta = false)
+
+  pip.close()
+  grey.close()
+  red.close()
+  overlay.close()
+  track.close()
+  source.close()
+  tractor.close()
+
+  // Nothing of the graph is left in this process now; what follows is rebuilt from the file alone.
+  val loaded   = Xml.load(profile, path)
+  val reopened = loaded.asTractor.getOrElse(throw new MltException("the project is not a tractor"))
+
+  println(s"  reopened: ${reopened.trackCount} tracks, ${reopened.length} frames")
+
+  for i <- 0 until reopened.trackCount do
+    val t  = reopened.track(i)
+    val pl = t.asPlaylist.getOrElse(throw new MltException(s"track $i is not a playlist"))
+
+    val entries = pl.clips.map(c => if c.blank then "blank" else s"${c.length}f").mkString(", ")
+
+    println(s"  track $i: $entries — ${pl.filterCount} filter(s)")
+
+    pl.close()
+    t.close()
+
+  // Saving what was loaded must write the project, not a note saying where it came from.
+  val rewritten = Xml.serialise(loaded, title = Some("Demo Project"), includeMeta = false)
+
+  println(s"  saves back identically: ${rewritten == written}")
+
+  // And an edit made to a reopened project must be what the next save records — the whole point of a
+  // project format being a round trip rather than an export.
+  val track0 = reopened.track(0)
+  val edited = track0.asPlaylist.get
+  val was    = edited.length
+
+  edited.removeRegion(0, 5)
+  reopened.refresh()
+
+  Xml.save(loaded, "mlt-project-2.mlt", includeMeta = false)
+
+  val again    = Xml.load(profile, "mlt-project-2.mlt")
+  val tractor2 = again.asTractor.get
+  val track2   = tractor2.track(0)
+  val after    = track2.asPlaylist.get
+
+  println(s"  rippled 5 frames out of track 0 ($was -> ${edited.length}), saved, reopened: ${after.length} frames")
+
+  after.close()
+  track2.close()
+  tractor2.close()
+  again.close()
+  edited.close()
+  track0.close()
+  reopened.close()
+  loaded.close()
 
 // What is installed, and what it says about itself — the backing for an effects browser, which
 // otherwise requires the user to already know the module names.

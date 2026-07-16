@@ -1,5 +1,6 @@
 package io.github.edadma.mlt
 
+import scala.io.Source
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 
@@ -146,6 +147,16 @@ class Service private[mlt] (ptr: lib.mlt_service) extends Properties(ptr):
   def moveFilter(from: Int, to: Int): Unit =
     guard(if lib.mlt_service_move_filter(ptr, from, to) != 0 then fail("mlt_service_move_filter"))
 
+  /** Which subclass of service this reports itself as.
+    *
+    * It reports a *label*, not a type: MLT answers by reading the object's `mlt_type` and `resource`
+    * properties, and a playlist is a playlist to this call because its `resource` reads "<playlist>".
+    * That is reliable for anything reached through a graph, and it is how MLT's own C++ binding
+    * decides a downcast — but a project loaded from a file has had its root's `resource` overwritten
+    * with the file's path, and so reports [[ServiceType.Producer]] whatever it really is. Prefer
+    * [[Producer.asTractor]], which examines the object instead of asking it. */
+  def serviceType: ServiceType = guard(ServiceType.of(lib.mlt_service_identify(ptr)))
+
 /** Anything that produces frames over a timeline — a media file, a generated colour, a playlist, a
   * multitrack tractor.
   *
@@ -176,6 +187,33 @@ class Producer private[mlt] (ptr: lib.mlt_producer) extends Service(ptr):
   /** Playback rate: 1.0 normal, 0.0 paused, negative reverse. */
   def speed: Double            = guard(lib.mlt_producer_get_speed(ptr))
   def speed_=(v: Double): Unit = guard(if lib.mlt_producer_set_speed(ptr, v) != 0 then fail("set_speed"))
+
+  /** This producer as a [[Tractor]], if it is one — how a loaded project's tracks are reached, since
+    * [[Xml.load]] can only promise a producer.
+    *
+    * Unlike [[serviceType]] this examines the object rather than believing its label: only a tractor
+    * carries the multitrack it combines, so asking for that answers the question even for a project
+    * root whose label the XML producer has overwritten.
+    *
+    * The result is a wrapper of its own, with a reference of its own, and must be closed. Closing it
+    * does not disturb this one. */
+  def asTractor: Option[Tractor] = guard {
+    if lib.mlt_tractor_multitrack(ptr) == null then scala.None else Some(borrowed(ptr)(new Tractor(_)))
+  }
+
+  /** This producer as a [[Playlist]], if it is one — how a track of a loaded project is read as the
+    * sequence of clips it is.
+    *
+    * This goes on the label ([[serviceType]]), there being nothing on a playlist to test for the way
+    * a tractor has its multitrack. That is sound for a track reached through a [[Tractor]], which is
+    * where a project keeps its playlists, and for anything [[Xml.load]] returns. It is not sound for a
+    * project reached by path through [[Producer.apply]], whose root MLT relabels: that answers `None`
+    * here whatever it is.
+    *
+    * The result is a wrapper of its own and must be closed. */
+  def asPlaylist: Option[Playlist] = guard {
+    if serviceType != ServiceType.Playlist then scala.None else Some(borrowed(ptr)(new Playlist(_)))
+  }
 
   override protected def destroy(): Unit = lib.mlt_producer_close(ptr)
 
@@ -641,6 +679,126 @@ object Consumer:
     if c == null then throw new MltException("mlt: mlt_consumer_new failed")
     new Consumer(c)
 
+/** MLT XML — the project format, and what makes a graph outlive the process that built it.
+  *
+  * It is the same format Shotcut and Kdenlive save, so a project written here opens there and theirs
+  * opens here. What it stores is the graph: the producers with their resources and properties, the
+  * playlists with their cuts and blanks, the tracks, the filters, the transitions, and the profile
+  * everything renders against. Reference `.mlt` files by path from another `.mlt` and they nest.
+  *
+  * Saving is a consumer and loading is a producer, which is worth knowing because it means neither
+  * needs anything special to work — but both have a surprise in them, and each is documented on the
+  * method it belongs to. */
+object Xml:
+
+  /** Write `root` and everything it reaches to `path` as MLT XML.
+    *
+    * Unlike an encode, this finishes before it returns. The XML consumer serialises the graph as it
+    * starts, and by default renders no frames at all, so there is nothing to wait on — set
+    * `processAllFrames` only for a filter that works in two passes (vidstab is the usual one),
+    * measuring the footage on the first and storing what it learned as properties for the second. A
+    * save that does not render is a save that costs nothing.
+    *
+    * `includeMeta` keeps the `meta.*` properties, which is where MLT files away what it learned about
+    * a media file when it opened it — the codec, the stream layout, the tags. It is the larger half
+    * of a small project file, and it is all rederivable by opening the media again, so a project that
+    * is under version control or is going to be edited by hand is better off without it. */
+  def save(
+      root: Producer,
+      path: String,
+      title: Option[String] = scala.None,
+      includeMeta: Boolean = true,
+      processAllFrames: Boolean = false,
+  ): Unit = run(root, path, title, includeMeta, processAllFrames)(_ => ())
+
+  /** Serialise `root` to a string rather than a file — a project saved without touching the disk,
+    * which is what an undo stack wants a snapshot to be.
+    *
+    * MLT has no separate service for this. The XML consumer decides between writing a file and
+    * storing a property by looking for a period in its resource: a name with no extension is not a
+    * file but the name of a property to leave the XML in. This method hides that, and takes the
+    * property back out.
+    *
+    * The result is the same XML [[save]] writes, minus the indentation. */
+  def serialise(
+      root: Producer,
+      title: Option[String] = scala.None,
+      includeMeta: Boolean = true,
+      processAllFrames: Boolean = false,
+  ): String = run(root, "xml_string", title, includeMeta, processAllFrames)(
+    _.get("xml_string").getOrElse(throw new MltException("mlt: the xml consumer stored nothing")),
+  )
+
+  /** Both entry points are the same consumer, differing only in what its resource is taken to mean.
+    * The profile comes from the graph itself — a service already knows the one it renders against, and
+    * the consumer must share it or the two disagree about what a frame is. */
+  private def run[A](root: Producer, resource: String, title: Option[String], meta: Boolean, all: Boolean)(
+      take: Consumer => A,
+  ): A = Zone {
+    val profile = lib.mlt_service_profile(root.ptr)
+
+    if profile == null then throw new MltException("mlt: the graph has no profile to serialise against")
+
+    val c = lib.mlt_factory_consumer(profile, c"xml", toCString(resource))
+
+    if c == null then throw new MltException("mlt: no xml consumer — is the xml module installed?")
+
+    val consumer = new Consumer(c)
+
+    try
+      title.foreach(consumer.set("title", _))
+      if !meta then consumer.setInt("no_meta", 1)
+      if all then consumer.setInt("all", 1)
+
+      consumer.connect(root)
+      consumer.start()
+
+      val a = take(consumer)
+
+      consumer.stop()
+      a
+    finally consumer.close()
+  }
+
+  /** Open the project at `path` — the graph it describes, ready to be edited and saved again.
+    *
+    * **`profile` is overwritten by the project's own.** A project records the format it was cut
+    * against, and opening it makes that format the one `profile` describes: a PAL profile handed to a
+    * 720p project comes back describing 720p. That is what opening a project should mean — the frame
+    * rate the positions were counted in has to survive the trip or they mean nothing — but it is a
+    * mutation of something the caller owns, and it happens whether or not the profile was asked for
+    * by name.
+    *
+    * What comes back is the project's outermost producer, which for a project of any substance is a
+    * tractor: reach its tracks with [[Producer.asTractor]].
+    *
+    * This reads the file and hands MLT the text, rather than handing MLT the path, and the difference
+    * is one of *identity*: given a path, MLT remembers the graph as being that file, and serialising
+    * it again writes a four-line reference to the file instead of the graph — so an edit made to a
+    * project opened that way is silently dropped by the next save. Given text, there is no file for
+    * the graph to be, and it serialises as itself. The cost is where relative resources are resolved
+    * from: normally the `root` attribute in the XML says, and MLT records one in every project it
+    * writes, but a project written with `no_root` leaves it out, and then only the file's own location
+    * can answer — which text does not carry. Such a project loses its relative media here.
+    *
+    * `Producer(profile, path)` is the other reading, and the right one for a project that is a *part*
+    * of the one being built: it stays a reference, which is what nesting a project on a track means. */
+  def load(profile: Profile, path: String): Producer =
+    val source =
+      try Source.fromFile(path)
+      catch case e: Exception => throw new MltException(s"mlt: cannot read project '$path' — ${e.getMessage}")
+
+    val xml =
+      try source.mkString
+      finally source.close()
+
+    parse(profile, xml)
+
+  /** Read a project back from a string — the other half of [[serialise]], and how an undo stack gets
+    * its snapshot back. [[load]]'s notes about the profile and about relative resources apply here
+    * too, this being what it is built on. */
+  def parse(profile: Profile, xml: String): Producer = Producer(profile, xml, Some("xml-string"))
+
 /** A single rendered frame. Obtain one from [[Service.frame]]; it must be closed. */
 class Frame private[mlt] (ptr: lib.mlt_frame) extends Properties(ptr):
 
@@ -804,6 +962,19 @@ def rgbaToArgb32(buffer: Ptr[Byte], count: Int): Unit =
 
     words(i) = ((v & 0xff00ff00) | ((v & 0x000000ff) << 16) | ((v >>> 16) & 0x000000ff)).toUInt
     i += 1
+
+/** Which subclass of service an object actually is — what [[Service.serviceType]] reports.
+  *
+  * This overlaps [[ServiceKind]] without being it: a kind is a category of *module* the repository
+  * lists, while a type is what a given object turned out to be. Only a type distinguishes a tractor
+  * from a playlist from a plain producer, all three of which are producers as far as the repository
+  * is concerned. */
+enum ServiceType:
+  case Invalid, Unknown, Producer, Tractor, Playlist, Multitrack, Filter, Transition, Consumer, Field, Link, Chain
+
+object ServiceType:
+  private[mlt] def of(v: Int): ServiceType =
+    if v >= 0 && v < values.length then fromOrdinal(v) else ServiceType.Unknown
 
 /** Which kind of service a name refers to. The same name can mean different things to different
   * kinds — "mix" is both a filter and a transition — so looking anything up in the repository takes

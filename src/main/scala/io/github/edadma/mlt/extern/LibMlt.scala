@@ -191,7 +191,9 @@ object LibMlt:
   /** Reorder the attached filters, which reorders how they are applied. Returns 0 on success. */
   def mlt_service_move_filter(self: mlt_service, from: CInt, to: CInt): CInt = extern
 
-  /** What subclass a service actually is — one of the `mlt_service_*_type` values. */
+  /** What subclass a service reports itself as — one of the `mlt_service_*_type` values. This reads
+    * the `mlt_type` and `resource` properties rather than inspecting the object, so it reports a
+    * label and not a type: anything that overwrites `resource` changes the answer. */
   def mlt_service_identify(self: mlt_service): CInt = extern
 
   // -- Producer --------------------------------------------------------------------------------

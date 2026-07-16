@@ -3,11 +3,11 @@
 Scala Native bindings for [MLT](https://www.mltframework.org/) — the multitrack audio/video
 authoring framework that powers Shotcut, Kdenlive, and Flowblade.
 
-> **Status:** early, but it edits, plays, and encodes real video. The framework lifecycle, profiles,
-> the property bag, producers (including `avformat` media files), frame rendering, consumers,
-> playlists, filters, transitions, and multitrack tractors all work — `sbt run` assembles a timeline,
-> composites two tracks, decodes a clip frame by frame, and transcodes it to H.264. Reading and
-> writing MLT XML is next.
+> **Status:** early, but it edits, plays, encodes, saves and reopens real video. The framework
+> lifecycle, profiles, the property bag, producers (including `avformat` media files), frame
+> rendering, consumers, playlists, filters, transitions, multitrack tractors, and MLT XML projects
+> all work — `sbt run` assembles a timeline, composites two tracks, decodes a clip frame by frame,
+> transcodes it to H.264, and saves a project that reopens as the same graph.
 
 ## Requirements
 
@@ -100,9 +100,24 @@ pip.setInAndOut(0, tractor.length - 1)
 tractor.plantTransition(pip, 0, 1)
 ```
 
+Save the whole graph as a project and open it again — the same MLT XML that Shotcut and Kdenlive
+read and write:
+
+```scala
+Xml.save(tractor, "project.mlt", title = Some("My Film"))
+
+val loaded  = Xml.load(profile, "project.mlt")
+val project = loaded.asTractor.get   // what a project of any substance is
+
+for i <- 0 until project.trackCount do
+  val track = project.track(i)
+
+  track.asPlaylist.foreach(pl => println(s"track $i: ${pl.count} entries, ${pl.length} frames"))
+```
+
 `sbt run` renders a frame of the bundled `demo.mp4` as a PPM, plays the clip through to the end,
-transcodes it to `mlt-export.mp4`, assembles the timeline above, greyscales a clip, and composites a
-moving inset over a second track.
+transcodes it to `mlt-export.mp4`, assembles the timeline above, greyscales a clip, composites a
+moving inset over a second track, and saves a project, reopens it, edits it, and saves it again.
 
 ## Design
 
@@ -232,6 +247,48 @@ vary more than their names suggest — `composite` insets its `b` track into its
 rectangle its `geometry` names, and a geometry with two keyframes makes that rectangle a path the
 inset travels as the frames advance. `Mlt.transitions` lists what is installed and `Mlt.metadata`
 reports what each one says about itself; this binding plants them and does not second-guess them.
+
+### Projects: the difference between a graph and a reference
+
+MLT XML stores a graph — producers with their resources, playlists with their cuts and blanks,
+tracks, filters, transitions, and the profile it all renders against. A `.mlt` file can also *be* a
+producer, since a project may sit on a track of a larger project, and that is where a trap lives.
+
+Given a **path**, MLT remembers the graph as being that file. Serialise it again and what comes out
+is a four-line reference to the file rather than the graph — which is right for a nested project, and
+silent data loss for an edited one:
+
+```xml
+<producer id="tractor0" in="0" out="54">
+  <property name="resource">project.mlt</property>
+  <property name="mlt_service">xml</property>
+  <property name="xml">was here</property>
+</producer>
+```
+
+Given **text**, there is no file for the graph to be, and it serialises as itself. So `Xml.load`
+reads the file and hands MLT the text: open a project, move a clip, save, and the save records the
+move. `Producer(profile, "other.mlt")` is the other reading, and the one to use when a project is a
+part of the one being built.
+
+The cost is where relative resources resolve from. Normally the `root` attribute in the XML says, and
+MLT records one in every project it writes; a project written with `no_root` has none, and then only
+the file's own location can answer — which text does not carry.
+
+Opening a project also **overwrites the profile passed to it** with the project's own. A project
+records the format it was cut against, and the frame rate its positions were counted in has to
+survive the trip or they mean nothing.
+
+### Asking what something is
+
+`Service.serviceType` reports a label rather than a type: MLT answers by reading the object's
+`mlt_type` and `resource` properties, and a playlist is a playlist to that call because its
+`resource` reads `<playlist>`. It is reliable for anything reached through a graph, and it is how
+MLT's own C++ binding decides a downcast — but anything that overwrites `resource` changes the
+answer, which is exactly what loading a project by path does to its root.
+
+`Producer.asTractor` therefore examines the object instead of asking it: only a tractor carries the
+multitrack it combines, so looking for that answers the question whatever the label says.
 
 ### Pixel formats, and the one unavoidable copy
 

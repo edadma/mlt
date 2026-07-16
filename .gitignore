@@ -25,6 +25,8 @@ project/.bloop/
 # demo output (demo.mp4 is an input and IS committed)
 *.ppm
 mlt-export.mp4
+mlt-project.mlt
+mlt-project-2.mlt
 
 .bloop/
 .metals/
