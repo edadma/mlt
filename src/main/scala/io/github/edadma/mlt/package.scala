@@ -987,6 +987,31 @@ object Profile:
     new Profile(p)
   }
 
+  /** Build a custom profile from explicit geometry — a square-pixel, progressive profile `width`x
+    * `height` running `fpsNum/fpsDen` frames per second — for when no named preset matches the format
+    * an application authors and renders against. Frame rate is a rational so the broadcast fractional
+    * rates are exact (29.97 = 30000/1001, 23.976 = 24000/1001), not a rounded double. Pixels are
+    * square (sample aspect 1:1, display aspect the pixel dimensions) and the profile is marked
+    * explicit so MLT keeps it rather than adopting the first producer's format. Colourspace is
+    * Rec. 709 for HD heights (>= 720) and Rec. 601 below, the usual SD/HD split. */
+  def custom(width: Int, height: Int, fpsNum: Int, fpsDen: Int): Profile =
+    require(width > 0 && height > 0, "profile dimensions must be positive")
+    require(fpsNum > 0 && fpsDen > 0, "frame rate must be positive")
+    val p = lib.mlt_profile_init(null)
+    if p == null then throw new MltException("mlt: could not create a custom profile")
+    p._2  = fpsNum
+    p._3  = fpsDen
+    p._4  = width
+    p._5  = height
+    p._6  = 1                             // progressive
+    p._7  = 1                             // sample_aspect_num — square pixels
+    p._8  = 1                             // sample_aspect_den
+    p._9  = width                         // display_aspect_num — follows the pixel dimensions
+    p._10 = height                        // display_aspect_den
+    p._11 = if height >= 720 then 709 else 601
+    p._12 = 1                             // explicit: do not adopt a producer's format
+    new Profile(p)
+
   /** The environment's default profile — what MLT falls back to when nothing is specified. */
   def default: Profile =
     val p = lib.mlt_profile_init(null)
